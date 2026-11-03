@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import hmac
+import socket
 import subprocess
 import sys
 import time
@@ -34,6 +35,7 @@ IMAGES = ["docker.io/chrislusf/seaweedfs:4.52", "docker.io/chrislusf/seaweedfs:4
 NAMESPACE = "default"
 NAME = "s3"
 PORT = 9000
+NODEPORT = 30900                                         # same server, reachable from the VM (no kubectl needed)
 ENDPOINT = f"http://{NAME}.{NAMESPACE}.svc:{PORT}"      # what Elasticsearch (inside k8s) connects to
 REGION = "us-east-1"                                     # arbitrary: the server does not care
 DUMMY_USER = DUMMY_PASS = "vgi-local"                    # SigV4 needs *some* key; auth is open
@@ -66,21 +68,37 @@ apiVersion: v1
 kind: Service
 metadata: {{name: {NAME}, namespace: {NAMESPACE}}}
 spec:
+  type: NodePort
   selector: {{app: {NAME}}}
-  ports: [{{port: {PORT}, targetPort: {PORT}}}]
+  ports: [{{port: {PORT}, targetPort: {PORT}, nodePort: {NODEPORT}}}]
 """
 
 
+def reachable(host: str = "127.0.0.1", port: int = NODEPORT) -> bool:
+    try:
+        socket.create_connection((host, port), timeout=2).close()
+        return True
+    except OSError:
+        return False
+
+
+def have_kubectl() -> bool:
+    return sh("kubectl get ns default").returncode == 0
+
+
 def is_ready() -> bool:
-    r = sh(f"kubectl get deployment {NAME} -n {NAMESPACE} -o jsonpath='{{.status.readyReplicas}}'")
-    return r.returncode == 0 and r.stdout.strip() == "1"
+    """True when the S3 server answers on the VM's NodePort (works without kubectl)."""
+    return reachable()
 
 
 def ensure_server(log=print) -> bool:
-    """Deploy the S3 server if it isn't running. True when it is ready to use."""
+    """Deploy the S3 server if it isn't running (needs kubectl, i.e. root). True when it is ready to use."""
     if is_ready():
         log(f"  S3 server already running ({ENDPOINT})")
         return True
+    if not have_kubectl():
+        log("  ❌ the S3 server is not running and this user has no kubectl; the sandbox setup should have started it")
+        return False
     for image in IMAGES:
         log(f"  starting S3 server: {image}")
         sh(f"kubectl delete deployment {NAME} -n {NAMESPACE} --ignore-not-found --wait=true")
@@ -90,9 +108,11 @@ def ensure_server(log=print) -> bool:
             continue
         r = sh(f"kubectl rollout status deployment/{NAME} -n {NAMESPACE} --timeout=150s", timeout=200)
         if "successfully rolled out" in r.stdout:
-            time.sleep(4)                       # the S3 port opens a few seconds after the pod is Ready
-            log(f"  S3 server ready ({image})")
-            return True
+            for _ in range(30):                 # the S3 port opens a few seconds after the pod is Ready
+                if reachable():
+                    log(f"  S3 server ready ({image})")
+                    return True
+                time.sleep(2)
         log(f"    not ready: {(r.stdout + r.stderr).strip()[-160:]}")
     log("  ❌ no S3 server image could be started")
     return False
@@ -102,15 +122,11 @@ def stop_server() -> None:
     sh(f"kubectl delete deployment/{NAME} service/{NAME} -n {NAMESPACE} --ignore-not-found")
 
 
-def cluster_ip() -> str:
-    return sh(f"kubectl get svc {NAME} -n {NAMESPACE} -o jsonpath='{{.spec.clusterIP}}'").stdout.strip()
-
-
 class S3:
-    """Path-style S3 over plain HTTP from the VM to the Service's ClusterIP (SigV4, dummy key)."""
+    """Path-style S3 over plain HTTP from the VM to the server's NodePort (SigV4, dummy key)."""
 
     def __init__(self, hostport: str | None = None):
-        self.hostport = hostport or f"{cluster_ip()}:{PORT}"
+        self.hostport = hostport or f"127.0.0.1:{NODEPORT}"
 
     def _request(self, method: str, path: str, query: str = "", body: bytes = b""):
         now = datetime.datetime.now(datetime.timezone.utc)

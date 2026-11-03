@@ -5,7 +5,7 @@ One entry point, in the order things must happen. Every phase is idempotent: re-
 is safe, and a phase that fails can be re-run on its own with --only.
 
     git clone --depth 1 --branch <tag> <this repo> soc && cd soc
-    sudo ./start.sh                  # writes env.sh, then runs both lanes below in the background
+    ./start.sh                       # writes env.sh, then asks systemd to run both lanes below as you
     ./soc-status                     # what is done, running or failed
 
 Under the hood (all stdlib Python 3; `source env.sh` first):
@@ -140,7 +140,11 @@ def _state_file(name):
 
 def mark(name, status, **extra):
     os.makedirs(STATE_DIR, exist_ok=True)
-    cur = read_state(name) or {}
+    try:
+        with open(_state_file(name)) as f:
+            cur = json.load(f)
+    except (OSError, ValueError):
+        cur = {}
     cur.update(status=status, **extra)
     cur.setdefault("started", time.time())
     tmp = _state_file(name) + ".tmp"
@@ -149,12 +153,18 @@ def mark(name, status, **extra):
     os.replace(tmp, _state_file(name))
 
 
+SYSTEM_STATE_DIR = "/opt/vgi/state"      # phases the sandbox setup (root) already did: llm, federation
+PREPARED = ("llm", "federation")
+
+
 def read_state(name):
-    try:
-        with open(_state_file(name)) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return None
+    for d in (STATE_DIR, SYSTEM_STATE_DIR):
+        try:
+            with open(os.path.join(d, f"{name}.json")) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            continue
+    return None
 
 
 def wait_for(*names, timeout=3600):
@@ -214,7 +224,10 @@ def check():
     s, b = kb("GET", "/api/agent_builder/agents")
     (ok if s == 200 else fail)(f"Agent Builder API (HTTP {s})")
     bad += s != 200
-    (ok if shutil.which("kubectl") else warn)("kubectl " + ("found" if shutil.which("kubectl") else "not found — the S3 server and the LLM helper need it"))
+    for p_ in PREPARED:
+        st = (read_state(p_) or {}).get("status")
+        (ok if st == "done" else warn)(f"sandbox setup phase '{p_}': {st or 'not recorded'}"
+                                       + ("" if st == "done" else " — run as root: python3 scripts/sandbox_prep.py"))
     if not os.path.isdir(os.path.join(GEN, "vgi_sim")):
         fail(f"generator package not found at {GEN}")
         bad += 1
@@ -407,10 +420,8 @@ def agent():
 
 
 def public_kibana_url():
-    """The Kibana URL a learner's browser uses (the managed preset sets server.publicBaseUrl)."""
-    r = subprocess.run("kubectl get kibana -n default -o jsonpath='{.items[0].spec.config.server\\.publicBaseUrl}'",
-                       shell=True, capture_output=True, text=True)
-    url = r.stdout.strip().strip("'")
+    """The Kibana URL a learner's browser uses (the sandbox setup records it in env.sh as KIBANA_PUBLIC_URL)."""
+    url = os.environ.get("KIBANA_PUBLIC_URL", "").strip()
     return url.rstrip("/") if url.startswith("http") else KB
 
 
@@ -600,11 +611,18 @@ SEED = [("check", check), ("campaign", campaign), ("hunt", hunt), ("guardduty", 
 GROUPS = {"check": [("check", check)], **LANES, "seed": SEED, "verify": [("verify", verify)], "status": [("status", status)]}
 
 
-def run_phases(phases):
+def run_phases(phases, skip_done=False):
+    """skip_done: resume a lane. Phases already marked done are not repeated (re-running `campaign` would reseed the attack)."""
     rc = 0
     for n, f in phases:
         t = time.time()
+        if skip_done and (read_state(n) or {}).get("status") == "done":
+            print(f"\n\033[1m▶ {n}\033[0m — already done, skipping", flush=True)
+            continue
         print(f"\n\033[1m▶ {n}\033[0m — {(f.__doc__ or '').strip().splitlines()[0]}", flush=True)
+        if n in PREPARED and (read_state(n) or {}).get("status") == "done" and os.geteuid() != 0:
+            print("  ✅ prepared by the sandbox setup (it needs root); nothing to do")
+            continue
         if n in NEEDS:
             wait_for(*NEEDS[n])
         mark(n, "running", started=t, error="")
@@ -626,7 +644,7 @@ def load():
     with open(log, "w") as lf:
         child = subprocess.Popen([sys.executable, os.path.join(KIT, "deploy.py"), "agentic"],
                                  stdout=lf, stderr=subprocess.STDOUT, env=os.environ)
-        rc = run_phases(LANES["pipeline"])
+        rc = run_phases(LANES["pipeline"], skip_done=True)
         rc = child.wait() or rc
     print(f"(agentic lane log: {log})")
     return rc
@@ -662,7 +680,7 @@ def main():
     print(f"Target: {KB or '(KIBANA_URL not set)'}  (space: {SPACE})")
     if a.group in ("check", "verify"):
         return phases[0][1]() or 0
-    rc = run_phases(phases)
+    rc = run_phases(phases, skip_done=(a.group in LANES and not a.only and not a.start))
     if a.group == "seed":
         print("\nNext: python3 deploy.py verify")
     return rc
