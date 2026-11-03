@@ -393,7 +393,7 @@ def workflows():
     llm = {"Anthropic-Claude-Sonnet-4-5": LLM_CONNECTOR, ".alerts-security.alerts-default": ALERTS}
     _deploy_workflow(os.path.join(KIT, "workflows", "attendee-safe-response.yaml"), TARS_NAME, llm)
     _deploy_workflow(os.path.join(KIT, "workflows", "mother-daily-hunt.yaml"), MOTHER_NAME,
-                     {**llm, "https://elasticon-security-a4cec4.kb.us-central1.gcp.elastic.cloud": KB})
+                     {**llm, "__KIBANA_URL__": KB})
     warn("MOTHER is created DISABLED and has no enable API: Workflows → MOTHER → Enable (CHECKLIST §5)")
     settings_body = {"workflowEnabled": True, "autoCloseEnabled": True,
                      "autoCloseConfidenceScoreMinThreshold": 0.7, "autoCloseConfidenceScoreMaxThreshold": 1,
