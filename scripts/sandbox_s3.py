@@ -59,7 +59,7 @@ spec:
       containers:
       - name: weed
         image: {image}
-        args: ["server", "-s3", "-s3.port={PORT}", "-dir=/data", "-volume.max=5"]
+        args: ["server", "-s3", "-s3.port={PORT}", "-dir=/data", "-master.volumeSizeLimitMB=128", "-volume.max=0"]
         ports: [{{containerPort: {PORT}}}]
         readinessProbe: {{tcpSocket: {{port: {PORT}}}, periodSeconds: 3}}
         resources: {{requests: {{memory: 256Mi, cpu: 100m}}}}
@@ -158,10 +158,15 @@ class S3:
         if status not in (200, 409):            # 409: already owned by us
             raise RuntimeError(f"create bucket {bucket}: HTTP {status} {body[:120]!r}")
 
-    def put(self, bucket: str, key: str, data: bytes) -> None:
-        status, body = self._request("PUT", f"/{bucket}/{key}", body=data)
-        if status != 200:
-            raise RuntimeError(f"put {key}: HTTP {status} {body[:120]!r}")
+    def put(self, bucket: str, key: str, data: bytes, attempts: int = 6) -> None:
+        """PUT with retries: a fresh SeaweedFS can answer 500 while it grows new volumes."""
+        for n in range(1, attempts + 1):
+            status, body = self._request("PUT", f"/{bucket}/{key}", body=data)
+            if status == 200:
+                return
+            if status < 500 or n == attempts:
+                raise RuntimeError(f"put {key}: HTTP {status} {body[:400]!r}")
+            time.sleep(2 * n)
 
     def delete(self, bucket: str, key: str) -> None:
         self._request("DELETE", f"/{bucket}/{key}")

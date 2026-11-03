@@ -455,7 +455,12 @@ def _enable_workflow(name):
         return
     s, b = kb("PUT", f"/api/workflows/workflow/{w['id']}", {"enabled": True})
     now = _find_workflow(name)
-    (ok if now and now.get("enabled") else fail)(f"enabled: {name} (HTTP {s})")
+    good = bool(now and now.get("enabled"))
+    (ok if good else fail)(f"enabled: {name} (HTTP {s})")
+    if not good:
+        why = b if isinstance(b, str) else {k: b.get(k) for k in ("enabled", "valid", "validationErrors") if k in b}
+        print(f"     response: {str(why)[:600]}")
+        print(f"     workflow now: {str({k: (now or {}).get(k) for k in ('enabled', 'valid')})}")
 
 
 def workflows():
