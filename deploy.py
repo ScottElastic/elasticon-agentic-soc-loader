@@ -43,7 +43,16 @@ KIT = os.path.dirname(os.path.abspath(__file__))       # seed-kit/
 SCRIPTS = os.path.join(KIT, "scripts")
 GEN = os.environ.get("VGI_GENERATOR") or os.path.join(KIT, "generator")
 ASSETS = os.path.join(KIT, "assets")
-STATE_DIR = os.environ.get("VGI_STATE_DIR") or os.path.join(KIT, ".state")          # one json file per phase
+
+
+def _default_state_dir():
+    """Phase state lives OUTSIDE the clone when the sandbox setup made a directory for it, so deleting and
+    re-cloning ~/soc while the loader is running cannot erase its progress (phases waiting on it would stall)."""
+    d = "/opt/vgi/learner-state"
+    return d if os.path.isdir(d) and os.access(d, os.W_OK) else os.path.join(KIT, ".state")
+
+
+STATE_DIR = os.environ.get("VGI_STATE_DIR") or _default_state_dir()                 # one json file per phase
 
 ES = os.environ.get("ELASTICSEARCH_URL", "").rstrip("/")
 KB = os.environ.get("KIBANA_URL", "").rstrip("/")

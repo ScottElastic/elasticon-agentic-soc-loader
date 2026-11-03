@@ -13,7 +13,8 @@ learner, never as root, when the learner runs ./start.sh.
   2. phase `llm`         the LLM connectors + ES|QL COMPLETION endpoints (the LLM key stays root-only)
   3. phase `federation`  the S3 server (kubectl) that will hold the GuardDuty archive
      Both phases are recorded in /opt/vgi/state/<phase>.json, which deploy.py treats as "already done".
-  4. systemd: vgi-pipeline.path / vgi-agentic.path. Touching ~/soc/.state/start-<lane> starts that lane
+  4. /opt/vgi/learner-state            the learner's phase state, outside ~/soc so re-cloning cannot erase it
+  5. systemd: vgi-pipeline.path / vgi-agentic.path. Touching ~/soc/.state/start-<lane> starts that lane
      as user `elastic` (see start.sh). Systemd keeps it running across challenge boundaries.
 
 Idempotent. Prints no secrets.
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -29,6 +31,7 @@ import time
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SYSTEM_DIR = "/opt/vgi"
 STATE_DIR = f"{SYSTEM_DIR}/state"
+LEARNER_STATE = f"{SYSTEM_DIR}/learner-state"
 LEARNER = os.environ.get("VGI_LEARNER", "elastic")
 SOC_DIR = f"/home/{LEARNER}/soc"           # where the learner clones the loader (the track tells them to)
 LANES = ("pipeline", "agentic")
@@ -96,6 +99,9 @@ def main() -> int:
         sys.exit("sandbox_prep.py must run as root (it is run by the track's challenge-1 setup script).")
     os.makedirs(STATE_DIR, mode=0o755, exist_ok=True)
     os.chmod(SYSTEM_DIR, 0o755)
+    # Where the learner's loader keeps its phase state: outside ~/soc, so re-cloning cannot erase it.
+    os.makedirs(LEARNER_STATE, mode=0o755, exist_ok=True)
+    shutil.chown(LEARNER_STATE, LEARNER, LEARNER)
 
     say("== 1. cluster CA, public Kibana URL, root API key")
     if subprocess.run([sys.executable, os.path.join(KIT, "scripts", "sandbox_env.py"), "--system"]).returncode != 0:
