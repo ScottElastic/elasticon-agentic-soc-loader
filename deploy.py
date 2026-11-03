@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
-"""ElastiCon crown-jewel workshop — stand it up on a new Elastic Serverless Security project.
+"""GLaDOS vs. Skynet: loader for the Instruqt sandbox (Elastic 9.5.x on ECK).
 
 One entry point, in the order things must happen. Every phase is idempotent: re-running it
 is safe, and a phase that fails can be re-run on its own with --only.
 
-    cd seed-kit
-    cp env.example env.sh && $EDITOR env.sh   # then:
-    source env.sh
+    git clone --depth 1 --branch <tag> <this repo> soc && cd soc
+    sudo ./start.sh                  # writes env.sh, then runs both lanes below in the background
+    ./soc-status                     # what is done, running or failed
 
-    python3 deploy.py check         # preconditions only — changes nothing
-    python3 deploy.py setup         # once per cluster (≈ 20–30 min)
-    python3 deploy.py seed          # the morning of every session (≈ 30 min incl. waits)
-    python3 deploy.py verify        # exit 0 = go
+Under the hood (all stdlib Python 3; `source env.sh` first):
 
-    python3 deploy.py setup --only workflows     # one phase
-    python3 deploy.py setup --from ml            # resume from a phase
-    python3 deploy.py --list                      # every phase, in order
+    python3 deploy.py check          # read-only preconditions
+    python3 deploy.py pipeline       # lane 1: data, rules, ML, the campaign, the GuardDuty archive
+    python3 deploy.py agentic        # lane 2: LLMs, GLaDOS, cases, Wiz, S3, TARS + MOTHER (runs in parallel)
+    python3 deploy.py load           # both lanes concurrently, in the foreground
+    python3 deploy.py status         # phase table from .state/
+    python3 deploy.py verify         # exit 0 = go
+    python3 deploy.py seed           # re-seed an already-loaded sandbox (new campaign relative to now)
 
-What each phase does is printed as it runs; CHECKLIST.md says what has to be switched on in
-the UI first (some of it has no API), and README.md explains the design.
+    python3 deploy.py pipeline --only rules     # one phase
+    python3 deploy.py pipeline --from ml        # resume a lane from a phase
+    python3 deploy.py --list                    # every phase, in order
+
+A phase that needs another lane's output waits for it (see NEEDS); progress lives in .state/*.json,
+which is what the track's per-challenge scripts poll.
 """
 from __future__ import annotations
 
@@ -38,7 +43,7 @@ KIT = os.path.dirname(os.path.abspath(__file__))       # seed-kit/
 SCRIPTS = os.path.join(KIT, "scripts")
 GEN = os.environ.get("VGI_GENERATOR") or os.path.join(KIT, "generator")
 ASSETS = os.path.join(KIT, "assets")
-GUIDE_CHECK = os.path.join(os.path.dirname(KIT), "guide_check.py")   # the guide's own smoke test, if present
+STATE_DIR = os.environ.get("VGI_STATE_DIR") or os.path.join(KIT, ".state")          # one json file per phase
 
 ES = os.environ.get("ELASTICSEARCH_URL", "").rstrip("/")
 KB = os.environ.get("KIBANA_URL", "").rstrip("/")
@@ -68,11 +73,9 @@ MOTHER_NAME = "MOTHER — Daily Threat Hunt: IOC Watchlist Sweep"
 RDS_RULE = "AWS RDS Snapshot Export"
 ML_JOBS = ["auth_high_count_logon_fails_ea", "auth_rare_source_ip_for_a_user_ea",
            "suspicious_login_activity_ea"]
-# Models the guide and workflows call by id. Serverless preconfigures them (Elastic Managed LLMs).
-NEEDED_CONNECTORS = [os.environ.get("LLM_CONNECTOR", "Anthropic-Claude-Sonnet-4-5")]
-NEEDED_INFERENCE = [".gp-llm-v2-completion", ".anthropic-claude-4.5-sonnet-completion"]
-LLM_CONNECTOR = os.environ.get("LLM_CONNECTOR", "Anthropic-Claude-Sonnet-4-5")   # TARS + MOTHER pin it
-ALERT_ANALYSIS_CONNECTOR = os.environ.get("ALERT_ANALYSIS_CONNECTOR", ".anthropic-claude-5-opus-chat_completion")
+# Connector ids created by scripts/sandbox_llm.py (the Serverless kit used Elastic-managed ids).
+LLM_CONNECTOR = os.environ.get("LLM_CONNECTOR", "vgi-sonnet")                          # TARS + MOTHER pin it
+ALERT_ANALYSIS_CONNECTOR = os.environ.get("ALERT_ANALYSIS_CONNECTOR", "vgi-opus")      # Alert analysis
 
 
 # ---------------------------------------------------------------- http
@@ -129,13 +132,59 @@ def py(*args, **kw):
     return run(sys.executable, *args, **kw)
 
 
+# ---------------------------------------------------------------- phase state (one file per phase)
+# Two lanes run at once, so each phase writes its own file: no shared file, no locking.
+def _state_file(name):
+    return os.path.join(STATE_DIR, f"{name}.json")
+
+
+def mark(name, status, **extra):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    cur = read_state(name) or {}
+    cur.update(status=status, **extra)
+    cur.setdefault("started", time.time())
+    tmp = _state_file(name) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cur, f)
+    os.replace(tmp, _state_file(name))
+
+
+def read_state(name):
+    try:
+        with open(_state_file(name)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def wait_for(*names, timeout=3600):
+    """Block until every named phase (possibly in the other lane) is done. Fails if one failed."""
+    t0, said = time.time(), 0
+    pending = list(names)
+    while pending:
+        for n in list(pending):
+            st = (read_state(n) or {}).get("status")
+            if st == "done":
+                pending.remove(n)
+            elif st == "failed":
+                raise SystemExit(f"  ❌ cannot continue: phase '{n}' failed (see its log)")
+        if not pending:
+            return
+        if time.time() - t0 > timeout:
+            raise SystemExit(f"  ❌ timed out after {timeout // 60} min waiting for: {', '.join(pending)}")
+        if time.time() - said > 120:
+            print(f"  … waiting for {', '.join(pending)}", flush=True)
+            said = time.time()
+        time.sleep(10)
+
+
 # ---------------------------------------------------------------- phase: check
 def check():
-    """Preconditions. Changes nothing. Every ❌ is a CHECKLIST.md item."""
+    """Preconditions. Changes nothing. Every ❌ means the sandbox is not ready for the loader."""
     bad = 0
     for v in ("ELASTICSEARCH_URL", "KIBANA_URL", "ELASTICSEARCH_API_KEY"):
         if not os.environ.get(v):
-            fail(f"{v} is not set (cd seed-kit && source env.sh)")
+            fail(f"{v} is not set (run scripts/sandbox_env.py, then `set -a; . ./env.sh; set +a`)")
             bad += 1
     if bad:
         raise SystemExit(1)
@@ -145,53 +194,32 @@ def check():
         raise SystemExit(1)
     ok(f"Elasticsearch {b.get('version', {}).get('number')} ({b.get('version', {}).get('build_flavor')})")
     s, b = kb("GET", "/api/status")
-    ok(f"Kibana reachable (HTTP {s})") if s == 200 else (fail(f"Kibana: HTTP {s} {str(b)[:120]}"), None)
+    (ok if s == 200 else fail)(f"Kibana reachable (HTTP {s})")
     bad += s != 200
-
-    s, c = kb("GET", "/api/actions/connectors")
-    names = {x.get("name") for x in c} | {x.get("id") for x in c} if s == 200 else set()
-    for n in NEEDED_CONNECTORS:
-        (ok if n in names else fail)(f"AI connector {n}")
-        bad += n not in names
-    s, inf = es("GET", "/_inference/_all")
-    ids = {e.get("inference_id") for e in (inf.get("endpoints", []) if isinstance(inf, dict) else [])}
-    for n in NEEDED_INFERENCE + [ALERT_ANALYSIS_CONNECTOR.replace("_chat_completion", "")]:
-        hit = any(i == n or i.startswith(n) for i in ids)
-        (ok if hit else warn)(f"inference endpoint {n}" + ("" if hit else " — COMPLETION steps need it"))
+    s, lic = es("GET", "/_license")
+    ltype = lic.get("license", {}).get("type") if isinstance(lic, dict) else None
+    (ok if ltype in ("trial", "enterprise", "platinum") else fail)(f"license: {ltype} (ML, Attack Discovery, Agent Builder, Workflows, federation need it)")
+    bad += ltype not in ("trial", "enterprise", "platinum")
     s, b = es("GET", "/_query/data_source")
-    (ok if s == 200 else fail)(f"ES|QL data federation API (HTTP {s})" +
-                               ("" if s == 200 else " — Lab 3 GuardDuty step will not work"))
-    s, b = es("GET", "/_ml/anomaly_detectors")          # _ml/info is 410 Gone on Serverless
+    (ok if s == 200 else warn)(f"ES|QL data federation API (HTTP {s})" + ("" if s == 200 else " — the GuardDuty step falls back to plain indices"))
+    s, b = es("GET", "/_ml/anomaly_detectors")
     (ok if s == 200 else fail)(f"Machine learning available (HTTP {s})")
     bad += s != 200
-    s, b = kb("GET", "/api/security/entity_store/status")
-    st = b.get("status") if isinstance(b, dict) else None
-    (ok if st == "running" else warn)(f"Entity Store status: {st or s}" +
-                                      ("" if st == "running" else " — enable it (CHECKLIST §2) or run --only entity"))
+    s, b = kb("GET", "/api/fleet/agent_policies?perPage=1")
+    (ok if s == 200 else fail)(f"Fleet available (HTTP {s})")
+    bad += s != 200
     s, b = kb("GET", "/api/workflows?size=1")
     (ok if s == 200 else fail)(f"Workflows API (HTTP {s})")
     bad += s != 200
     s, b = kb("GET", "/api/agent_builder/agents")
     (ok if s == 200 else fail)(f"Agent Builder API (HTTP {s})")
     bad += s != 200
-    if shutil.which("aws"):
-        bucket = os.environ.get("GD_BUCKET")
-        if bucket:
-            r = subprocess.run(["aws", "s3", "ls", f"s3://{bucket}/", "--region",
-                                os.environ.get("GD_BUCKET_REGION", "us-west-2")], capture_output=True, text=True)
-            (ok if r.returncode == 0 else fail)(f"AWS CLI can list s3://{bucket}" +
-                                                ("" if r.returncode == 0 else f" — {r.stderr.strip()[:120]}"))
-        else:
-            warn("GD_BUCKET not set — the GuardDuty archive phase will use the default bucket")
-    else:
-        warn("aws CLI not found — needed to upload the GuardDuty archive")
-    for v in ("GD_S3_ACCESS_KEY", "GD_S3_SECRET"):
-        (ok if os.environ.get(v) else warn)(f"{v} {'set' if os.environ.get(v) else 'not set — federation wiring will be skipped'}")
+    (ok if shutil.which("kubectl") else warn)("kubectl " + ("found" if shutil.which("kubectl") else "not found — the S3 server and the LLM helper need it"))
     if not os.path.isdir(os.path.join(GEN, "vgi_sim")):
         fail(f"generator package not found at {GEN}")
         bad += 1
     if bad:
-        raise SystemExit(f"\n{bad} blocking precondition(s). See CHECKLIST.md.")
+        raise SystemExit(f"\n{bad} blocking precondition(s).")
 
 
 # ---------------------------------------------------------------- setup phases
@@ -200,6 +228,11 @@ def settings():
     s, b = kb("POST", "/internal/kibana/settings", {"changes": {"dateFormat:tz": "UTC", "enableESQL": True}},
               version="1")
     (ok if s == 200 else warn)(f"advanced settings: dateFormat:tz=UTC, enableESQL (HTTP {s})")
+
+
+def llm():
+    """The sandbox LLMs: connectors vgi-opus / vgi-sonnet, ES|QL COMPLETION endpoints, Agent Builder models."""
+    py("sandbox_llm.py")
 
 
 def integrations():
@@ -373,12 +406,24 @@ def agent():
     py("wiz_tool.py")
 
 
+def public_kibana_url():
+    """The Kibana URL a learner's browser uses (the managed preset sets server.publicBaseUrl)."""
+    r = subprocess.run("kubectl get kibana -n default -o jsonpath='{.items[0].spec.config.server\\.publicBaseUrl}'",
+                       shell=True, capture_output=True, text=True)
+    url = r.stdout.strip().strip("'")
+    return url.rstrip("/") if url.startswith("http") else KB
+
+
+def _find_workflow(name):
+    s, wl = kb("GET", "/api/workflows?size=100")
+    return next((w for w in wl.get("results", []) if w["name"] == name), None) if s == 200 else None
+
+
 def _deploy_workflow(path, name, subs=None):
     y = open(path).read()
     for a, b in (subs or {}).items():
         y = y.replace(a, b)
-    s, wl = kb("GET", "/api/workflows?size=100")
-    cur = next((w for w in wl.get("results", []) if w["name"] == name), None) if s == 200 else None
+    cur = _find_workflow(name)
     if cur:
         s, b = kb("PUT", f"/api/workflows/workflow/{cur['id']}", {"yaml": y})
         (ok if s == 200 else fail)(f"workflow updated: {name} ({cur['id']}, HTTP {s}{'' if s == 200 else ' ' + str(b)[:200]})")
@@ -388,13 +433,28 @@ def _deploy_workflow(path, name, subs=None):
     return None
 
 
+def _enable_workflow(name):
+    """Workflows are created disabled. On 9.5.x `PUT {enabled: true}` turns them on (no UI step)."""
+    w = _find_workflow(name)
+    if not w:
+        fail(f"cannot enable '{name}': not found")
+        return
+    if w.get("enabled"):
+        ok(f"already enabled: {name}")
+        return
+    s, b = kb("PUT", f"/api/workflows/workflow/{w['id']}", {"enabled": True})
+    now = _find_workflow(name)
+    (ok if now and now.get("enabled") else fail)(f"enabled: {name} (HTTP {s})")
+
+
 def workflows():
-    """TARS and MOTHER (with this cluster's Kibana URL), then the managed Alert analysis workflow."""
+    """TARS and MOTHER (this sandbox's connector + Kibana URL, both enabled), then the managed Alert analysis workflow."""
     llm = {"Anthropic-Claude-Sonnet-4-5": LLM_CONNECTOR, ".alerts-security.alerts-default": ALERTS}
     _deploy_workflow(os.path.join(KIT, "workflows", "attendee-safe-response.yaml"), TARS_NAME, llm)
     _deploy_workflow(os.path.join(KIT, "workflows", "mother-daily-hunt.yaml"), MOTHER_NAME,
-                     {**llm, "__KIBANA_URL__": KB})
-    warn("MOTHER is created DISABLED and has no enable API: Workflows → MOTHER → Enable (CHECKLIST §5)")
+                     {**llm, "__KIBANA_URL__": public_kibana_url()})
+    _enable_workflow(TARS_NAME)
+    _enable_workflow(MOTHER_NAME)
     settings_body = {"workflowEnabled": True, "autoCloseEnabled": True,
                      "autoCloseConfidenceScoreMinThreshold": 0.7, "autoCloseConfidenceScoreMaxThreshold": 1,
                      "connectorId": ALERT_ANALYSIS_CONNECTOR, "agentId": "elastic-ai-agent",
@@ -406,7 +466,7 @@ def workflows():
     rule = next((r for r in (b.get("rules", []) if isinstance(b, dict) else []) if r["name"] == RDS_RULE), None)
     if not rule:
         fail(f"'{RDS_RULE}' not found for Alert analysis — run the rules phase first")
-        return
+        return 1
     if rule.get("attached"):
         ok(f"Alert analysis attached to '{RDS_RULE}'")
         return
@@ -440,11 +500,10 @@ def fp_history():
 
 
 def federation():
-    """The ES|QL data source + datasets over the S3 bucket (needs the read-only key pair)."""
-    if not (os.environ.get("GD_S3_ACCESS_KEY") and os.environ.get("GD_S3_SECRET")):
-        warn("GD_S3_ACCESS_KEY / GD_S3_SECRET not set — skipping; re-run --only federation once they are")
-        return
-    py("guardduty_seed.py", "--wire")
+    """Start the S3 server inside the sandbox that will hold the GuardDuty archive (image pull happens now, in parallel)."""
+    rc = run(sys.executable, os.path.join(SCRIPTS, "sandbox_s3.py"), "up", check=False)
+    if rc:
+        warn("no S3 server could be started: the GuardDuty step will load plain indices instead")
 
 
 # ---------------------------------------------------------------- seed phases (every session)
@@ -459,12 +518,14 @@ def hunt():
 
 
 def guardduty():
-    """Rebuild the GuardDuty archive around today's campaign and upload it to S3."""
-    s, _ = es("GET", "/_query/data_source")
-    if s != 200:                # no federation here: don't rewrite the shared S3 archive another cluster reads
-        warn(f"ES|QL federation is off on this cluster (HTTP {s}) — skipping the S3 archive")
-        return
-    py("guardduty_seed.py")
+    """Rebuild the GuardDuty archive around today's campaign, put it on the S3 server and wire ES|QL federation
+    to it (no credentials). If that fails for any reason, load the same findings as plain indices."""
+    rc = py("guardduty_seed.py", check=False)
+    if rc == 0:
+        rc = py("guardduty_seed.py", "--wire", check=False)
+    if rc != 0:
+        warn("federation over S3 did not work: loading the findings as plain indices (queries are unchanged)")
+        py("guardduty_seed.py", "--as-index")
 
 
 def wiz_refresh():
@@ -473,53 +534,121 @@ def wiz_refresh():
 
 
 def verify():
-    """The guide's own smoke test if the guide folder is next door; otherwise the kit's data checks."""
-    if os.path.exists(GUIDE_CHECK):
-        return run(sys.executable, GUIDE_CHECK, cwd=os.path.dirname(GUIDE_CHECK), check=False)
-    warn("guide_check.py not found next to seed-kit/ — running the kit's data checks only")
+    """The kit's own data checks, the lanes' state, and that TARS + MOTHER are on. Exit 0 = go."""
     rc = 0
+    for lane, phases in LANES.items():
+        names = [n for n, _ in phases if n != "check"]
+        bad = [n for n in names if (read_state(n) or {}).get("status") != "done"]
+        (ok if not bad else fail)(f"lane {lane}: {len(names) - len(bad)}/{len(names)} phases done"
+                                  + (f" (not done: {', '.join(bad)})" if bad else ""))
+        rc |= bool(bad)
     fired = run(sys.executable, "crownjewel_seed.py", "--status", check=False)
     for label, q in (
-            ("GuardDuty archive readable", "FROM guardduty_findings | STATS n = COUNT(*)"),
+            ("GuardDuty findings readable", "FROM guardduty_findings | STATS n = COUNT(*)"),
             ("Wiz misconfigurations present", "FROM security_solution-wiz.misconfiguration_latest | STATS n = COUNT(*)"),
             ("MOTHER watchlist present", "FROM vgi-threat-intel | STATS n = COUNT(*)"),
             ("closed RDS false positives",
              f'FROM {ALERTS} | WHERE kibana.alert.rule.name == "AWS RDS Snapshot Export" '
              'AND kibana.alert.workflow_status == "closed" | STATS n = COUNT(*)')):
-        s, b = es("POST", "/_query", {"query": q})
-        n = b["values"][0][0] if s == 200 and b.get("values") else 0
+        s_, b = es("POST", "/_query", {"query": q})
+        n = b["values"][0][0] if s_ == 200 and b.get("values") else 0
         (ok if n else fail)(f"{label}: {n}")
         rc |= not n
-    s, wl = kb("GET", "/api/workflows?size=100")
-    m = next((w for w in wl.get("results", []) if w["name"] == MOTHER_NAME), None) if s == 200 else None
-    (ok if m and m.get("enabled") else fail)(f"MOTHER {'enabled' if m and m.get('enabled') else 'missing or DISABLED'}")
-    return rc or fired or not (m and m.get("enabled"))
+    for name in (TARS_NAME, MOTHER_NAME):
+        w = _find_workflow(name)
+        (ok if w and w.get("enabled") else fail)(f"{name.split(' — ')[0]} {'enabled' if w and w.get('enabled') else 'missing or DISABLED'}")
+        rc |= not (w and w.get("enabled"))
+    return rc or fired
 
 
-SETUP = [("check", check), ("settings", settings), ("integrations", integrations), ("templates", templates),
-         ("entity", entity),
-         ("baseline", baseline), ("rules", rules), ("ml", ml), ("exposure", exposure), ("agent", agent),
-         ("workflows", workflows), ("cases", cases), ("roles", roles), ("fp-history", fp_history),
-         ("federation", federation)]
-SEED = [("check", check), ("campaign", campaign), ("hunt", hunt), ("guardduty", guardduty),
-        ("wiz-refresh", wiz_refresh)]
-GROUPS = {"check": [("check", check)], "setup": SETUP, "seed": SEED, "verify": [("verify", verify)],
-          "all": SETUP + SEED[1:] + [("verify", verify)]}
+def status():
+    """Phase table from .state/ (what the track's scripts poll)."""
+    names = [n for lane in LANES.values() for n, _ in lane if n != "check"]
+    now = time.time()
+    print(f"{'phase':<14}{'lane':<10}{'status':<10}{'minutes':>8}")
+    for lane, phases in LANES.items():
+        for n, _ in phases:
+            if n == "check":
+                continue
+            st = read_state(n) or {}
+            t0, t1 = st.get("started"), st.get("finished")
+            mins = f"{((t1 or now) - t0) / 60:.1f}" if t0 and st.get("status") in ("running", "done", "failed") else ""
+            print(f"{n:<14}{lane:<10}{st.get('status', '-'):<10}{mins:>8}" + (f"  {st['error']}" if st.get("error") else ""))
+    done = sum((read_state(n) or {}).get("status") == "done" for n in names)
+    print(f"\n{done}/{len(names)} phases done")
+    return 0 if done == len(names) else 1
+
+
+# ---------------------------------------------------------------- lanes
+# Two lanes run at the same time. The pipeline lane builds the data and detections; the agentic lane
+# builds everything that talks to an LLM or reads the data. A phase listed in NEEDS waits for others.
+LANES = {
+    "pipeline": [("check", check), ("settings", settings), ("integrations", integrations), ("templates", templates),
+                 ("entity", entity), ("baseline", baseline), ("rules", rules), ("ml", ml),
+                 ("campaign", campaign), ("hunt", hunt), ("fp-history", fp_history), ("guardduty", guardduty)],
+    "agentic": [("llm", llm), ("cases", cases), ("roles", roles), ("federation", federation),
+                ("exposure", exposure), ("agent", agent), ("workflows", workflows)],
+}
+NEEDS = {
+    "exposure": ["integrations"],            # both install Fleet packages: don't do it at the same time
+    "agent": ["baseline", "exposure"],       # tools reference the data streams + the exposure lookup index
+    "workflows": ["llm", "rules"],           # Alert analysis attaches to a rule
+    "guardduty": ["campaign", "federation"], # the archive is pinned to the seeded CloudTrail events
+    "fp-history": ["rules"],
+}
+SEED = [("check", check), ("campaign", campaign), ("hunt", hunt), ("guardduty", guardduty), ("wiz-refresh", wiz_refresh)]
+GROUPS = {"check": [("check", check)], **LANES, "seed": SEED, "verify": [("verify", verify)], "status": [("status", status)]}
+
+
+def run_phases(phases):
+    rc = 0
+    for n, f in phases:
+        t = time.time()
+        print(f"\n\033[1m▶ {n}\033[0m — {(f.__doc__ or '').strip().splitlines()[0]}", flush=True)
+        if n in NEEDS:
+            wait_for(*NEEDS[n])
+        mark(n, "running", started=t, error="")
+        try:
+            r = f()
+        except SystemExit as e:
+            mark(n, "failed", finished=time.time(), error=str(e.code)[:300])
+            raise
+        mark(n, "failed" if r else "done", finished=time.time(), error="returned non-zero" if r else "")
+        print(f"  ({time.time() - t:.0f} s)")
+        rc = r or rc
+    return rc
+
+
+def load():
+    """Both lanes at once in the foreground (start.sh runs them as two background units instead)."""
+    log = os.path.join(STATE_DIR, "agentic.log")
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(log, "w") as lf:
+        child = subprocess.Popen([sys.executable, os.path.join(KIT, "deploy.py"), "agentic"],
+                                 stdout=lf, stderr=subprocess.STDOUT, env=os.environ)
+        rc = run_phases(LANES["pipeline"])
+        rc = child.wait() or rc
+    print(f"(agentic lane log: {log})")
+    return rc
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("group", nargs="?", choices=GROUPS, default="check")
+    ap.add_argument("group", nargs="?", choices=[*GROUPS, "load"], default="check")
     ap.add_argument("--only", help="run just this phase of the group")
     ap.add_argument("--from", dest="start", help="resume the group from this phase")
     ap.add_argument("--list", action="store_true")
     a = ap.parse_args()
     if a.list:
-        for g in ("setup", "seed", "verify"):
+        for g in ("pipeline", "agentic", "seed", "verify"):
             print(f"\n{g}:")
             for n, f in GROUPS[g]:
                 print(f"  {n:<13} {(f.__doc__ or '').strip().splitlines()[0]}")
         return 0
+    if a.group == "load":
+        return load()
+    if a.group == "status":
+        return status()
     phases = GROUPS[a.group]
     names = [n for n, _ in phases]
     if a.only:
@@ -531,14 +660,11 @@ def main():
             sys.exit(f"--from {a.start}: not a phase of {a.group} ({', '.join(names)})")
         phases = phases[names.index(a.start):]
     print(f"Target: {KB or '(KIBANA_URL not set)'}  (space: {SPACE})")
-    rc = 0
-    for n, f in phases:
-        t = time.time()
-        print(f"\n\033[1m▶ {n}\033[0m — {(f.__doc__ or '').strip().splitlines()[0]}")
-        rc = f() or rc
-        print(f"  ({time.time() - t:.0f} s)")
-    if a.group in ("seed",):
-        print("\nNext: python3 deploy.py verify   (and enable MOTHER in the UI if you haven't)")
+    if a.group in ("check", "verify"):
+        return phases[0][1]() or 0
+    rc = run_phases(phases)
+    if a.group == "seed":
+        print("\nNext: python3 deploy.py verify")
     return rc
 
 

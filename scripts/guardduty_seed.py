@@ -21,23 +21,19 @@ flattens nested JSON — see --probe):
   guardduty/AWSLogs/<acct>/GuardDuty/<region>/YYYY/MM/DD/*.jsonl.gz       native nested GuardDuty
   guardduty-flat/AWSLogs/<acct>/GuardDuty/<region>/YYYY/MM/DD/*.jsonl.gz  flat scalar columns
 
-Usage:
-    source <scratchpad>/env.sh
+Where it lives: in the sandbox, on an S3-compatible server running in the same k3s cluster as
+Elasticsearch (sandbox_s3.py). Elasticsearch reads it with `auth: none`: no credential exists.
+
+Usage (after `source env.sh`):
     python3 guardduty_seed.py --dry-run        # build locally, print the timeline, upload nothing
-    python3 guardduty_seed.py --probe          # upload a 3-finding file only, for schema discovery
-    python3 guardduty_seed.py                  # build + upload the full archive
-    python3 guardduty_seed.py --wire           # create the ES data source + dataset (needs the key)
+    python3 guardduty_seed.py                  # build + upload the full archive (starts the S3 server)
+    python3 guardduty_seed.py --wire           # create the ES|QL data source + datasets over it
+    python3 guardduty_seed.py --as-index       # fallback: load the same findings as plain indices
     python3 guardduty_seed.py --status         # what is in S3 and in ES right now
-    python3 guardduty_seed.py --cleanup        # remove the S3 prefixes + the ES dataset/data source
+    python3 guardduty_seed.py --cleanup        # remove the objects + the ES dataset/data source
 
-Uploads use your own authenticated AWS CLI identity (AWS_PROFILE works). The read-only key
-pair is needed ONLY by --wire, for the Elasticsearch data source:
-    export GD_S3_ACCESS_KEY=<reader access key id>
-    export GD_S3_SECRET=<secret>          # never write this to a file in this folder
-
-Env: ELASTICSEARCH_URL, ELASTICSEARCH_API_KEY  (+ GD_S3_ACCESS_KEY / GD_S3_SECRET for --wire)
+Env: ELASTICSEARCH_URL, ELASTICSEARCH_API_KEY, SSL_CERT_FILE (see scripts/sandbox_env.py)
      GD_BUCKET        bucket the archive lives in   (default vgi-guardduty-archive)
-     GD_BUCKET_REGION the bucket's AWS region        (default us-west-2)
 """
 from __future__ import annotations
 
@@ -53,6 +49,9 @@ import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import sandbox_s3 as s3lib            # in-sandbox S3 server + client (same folder)  # noqa: E402
 
 ES = os.environ.get("ELASTICSEARCH_URL", "").rstrip("/")
 ES_KEY = os.environ.get("ELASTICSEARCH_API_KEY", "")
@@ -74,7 +73,7 @@ ANCHORS: dict = {}
 DELETE_DETECTOR = datetime.now(timezone.utc).replace(microsecond=0)
 
 BUCKET = os.environ.get("GD_BUCKET", "vgi-guardduty-archive")
-BUCKET_REGION = os.environ.get("GD_BUCKET_REGION", "us-west-2")
+BUCKET_REGION = os.environ.get("GD_BUCKET_REGION", s3lib.REGION)   # arbitrary for the in-sandbox server
 PREFIX_NESTED = f"guardduty/AWSLogs/{ACCOUNT}/GuardDuty/{REGION}"
 PREFIX_FLAT = f"guardduty-flat/AWSLogs/{ACCOUNT}/GuardDuty/{REGION}"
 
@@ -448,20 +447,27 @@ def build(findings, probe=False):
     return made
 
 
-def aws(*args, capture=True):
-    r = subprocess.run(["aws", *args], capture_output=capture, text=True)
-    if r.returncode != 0:
-        sys.exit(f"aws {' '.join(args[:3])} failed:\n{(r.stderr or r.stdout).strip()[:600]}")
-    return r.stdout
-
-
 def upload():
+    """Replace the archive on the in-sandbox S3 server with the freshly built files."""
+    if not s3lib.ensure_server(print):
+        sys.exit("No S3 server could be started; run `python3 guardduty_seed.py --as-index` for the fallback.")
+    cli = s3lib.S3()
+    cli.make_bucket(BUCKET)
     for pref in (PREFIX_NESTED, PREFIX_FLAT):
         local = os.path.join(STAGE, pref)
         if not os.path.isdir(local):
             continue
-        aws("s3", "sync", local, f"s3://{BUCKET}/{pref}/", "--region", BUCKET_REGION, "--delete")
-        print(f"  uploaded s3://{BUCKET}/{pref}/")
+        for key in cli.list(BUCKET, pref + "/"):          # an archive from an earlier seed
+            cli.delete(BUCKET, key)
+        n = 0
+        for root, _, files in os.walk(local):
+            for fn in sorted(files):
+                path = os.path.join(root, fn)
+                key = pref + "/" + os.path.relpath(path, local).replace(os.sep, "/")
+                with open(path, "rb") as f:
+                    cli.put(BUCKET, key, f.read())
+                n += 1
+        print(f"  uploaded {n} file(s) to s3://{BUCKET}/{pref}/")
 
 
 # ---------------------------------------------------------------- Elasticsearch
@@ -480,26 +486,17 @@ def es_req(method, path, body=None):
 
 
 def wire():
-    ak, sk = os.environ.get("GD_S3_ACCESS_KEY", ""), os.environ.get("GD_S3_SECRET", "")
-    if not ak or not sk:
-        sys.exit("Set GD_S3_ACCESS_KEY and GD_S3_SECRET (read-only key for <reader-user>).")
+    """Create the ES|QL data source + the two datasets over the in-sandbox S3 server (no credentials)."""
     ds_body = {"type": "s3", "description": "VGI GuardDuty findings export — survived the detector deletion",
-               "settings": {"auth": "static_credentials", "access_key": ak, "secret_key": sk}}
+               "settings": {"auth": "none", "endpoint": s3lib.ENDPOINT, "region": BUCKET_REGION}}
     print(es_req("PUT", f"/_query/data_source/{DS_NAME}", ds_body))
     for name, pref in ((DATASET_NAME, PREFIX_NESTED), (DATASET_FLAT, PREFIX_FLAT)):
+        # union_by_name is REQUIRED: the default first_file_wins resolves the schema from the
+        # earliest file only, which holds EC2/networkConnectionAction findings, so the IAM
+        # findings' awsApiCallAction + accessKeyDetails columns would vanish from the schema.
         body = {"data_source": DS_NAME, "resource": f"s3://{BUCKET}/{pref}/*/*/*/*.jsonl.gz",
-                # union_by_name is REQUIRED: the default first_file_wins resolves the schema from the
-                # earliest file only, which holds EC2/networkConnectionAction findings — the IAM
-                # findings' awsApiCallAction + accessKeyDetails columns would vanish from the schema.
-                "settings": {"region": BUCKET_REGION, "schema_resolution": "union_by_name"}}
-        r = es_req("PUT", f"/_query/dataset/{name}", body)
-        if "__error" in r and "unknown setting [region]" in r.get("body", ""):
-            # 9.5.x (ECH, experimental) wants the region on the DATA SOURCE; 9.6 on the dataset.
-            ds_body["settings"]["region"] = BUCKET_REGION
-            print(f"  9.5 layout: region on the data source", es_req("PUT", f"/_query/data_source/{DS_NAME}", ds_body))
-            body["settings"].pop("region")
-            r = es_req("PUT", f"/_query/dataset/{name}", body)
-        print(name, r)
+                "settings": {"schema_resolution": "union_by_name"}}     # 9.5: region lives on the data source
+        print(name, es_req("PUT", f"/_query/dataset/{name}", body))
     bad = 0
     for name in (DATASET_NAME, DATASET_FLAT):
         r = es_req("POST", "/_query", {"query": f"FROM {name} | LIMIT 1"})
@@ -513,14 +510,58 @@ def wire():
         sys.exit(f"{bad} dataset(s) not queryable")
 
 
+def _bulk(index, lines):
+    data = ("\n".join(lines) + "\n").encode()
+    req = urllib.request.Request(f"{ES}/_bulk", method="POST", data=data, headers={
+        "Authorization": f"ApiKey {ES_KEY}", "Content-Type": "application/x-ndjson"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        res = json.loads(r.read())
+    if res.get("errors"):
+        bad = next((i for i in res["items"] if next(iter(i.values())).get("error")), None)
+        sys.exit(f"bulk into {index} had errors: {str(bad)[:300]}")
+
+
+def as_index():
+    """Fallback when no S3 server can run: load the same findings as plain indices with the same
+    names, so every `FROM guardduty_findings` query in the labs works unchanged (just not 'in place')."""
+    mappings = {"dynamic_templates": [{"strings": {"match_mapping_type": "string", "mapping": {"type": "keyword"}}}]}
+    for name, pref in ((DATASET_NAME, PREFIX_NESTED), (DATASET_FLAT, PREFIX_FLAT)):
+        base = os.path.join(STAGE, pref)
+        if not os.path.isdir(base):
+            sys.exit(f"nothing built under {base}; run guardduty_seed.py first")
+        es_req("DELETE", f"/_query/dataset/{name}")
+        es_req("DELETE", f"/{name}")
+        r = es_req("PUT", f"/{name}", {"mappings": mappings})
+        if "__error" in r:
+            sys.exit(f"create index {name}: {r['body'][:200]}")
+        lines, n = [], 0
+        for root, _, files in os.walk(base):
+            for fn in sorted(files):
+                with gzip.open(os.path.join(root, fn), "rt") as f:
+                    for line in f:
+                        if line.strip():
+                            lines += [json.dumps({"index": {"_index": name}}), line.strip()]
+                            n += 1
+                            if n % 500 == 0:
+                                _bulk(name, lines)
+                                lines = []
+        if lines:
+            _bulk(name, lines)
+        es_req("POST", f"/{name}/_refresh")
+        print(f"  loaded {n} findings into index {name}")
+    r = es_req("POST", "/_query", {"query": f"FROM {DATASET_NAME} | STATS n = COUNT(*)"})
+    print("  FROM guardduty_findings ->", r.get("values") if "__error" not in r else r["body"][:200])
+
+
 def status():
-    print("S3:")
-    for pref in (PREFIX_NESTED, PREFIX_FLAT):
-        out = aws("s3", "ls", f"s3://{BUCKET}/{pref}/", "--recursive", "--region", BUCKET_REGION) or ""
-        lines = [l for l in out.splitlines() if l.strip()]
-        print(f"  {pref}: {len(lines)} object(s)")
-        for l in lines[:4]:
-            print(f"    {l}")
+    print("S3 server:", "ready" if s3lib.is_ready() else "not running", s3lib.ENDPOINT)
+    if s3lib.is_ready():
+        cli = s3lib.S3()
+        for pref in (PREFIX_NESTED, PREFIX_FLAT):
+            keys = cli.list(BUCKET, pref + "/")
+            print(f"  {pref}: {len(keys)} object(s)")
+            for k in keys[:3]:
+                print(f"    {k}")
     print("Elasticsearch:")
     print("  data_sources:", json.dumps(es_req("GET", "/_query/data_source"))[:300])
     print("  datasets:", json.dumps(es_req("GET", "/_query/dataset"))[:400])
@@ -530,16 +571,20 @@ def cleanup():
     for name in (DATASET_NAME, DATASET_FLAT):
         print(name, es_req("DELETE", f"/_query/dataset/{name}"))
     print(DS_NAME, es_req("DELETE", f"/_query/data_source/{DS_NAME}"))
-    for pref in (PREFIX_NESTED, PREFIX_FLAT):
-        aws("s3", "rm", f"s3://{BUCKET}/{pref}/", "--recursive", "--region", BUCKET_REGION)
-        print(f"  removed s3://{BUCKET}/{pref}/")
+    if s3lib.is_ready():
+        cli = s3lib.S3()
+        for pref in (PREFIX_NESTED, PREFIX_FLAT):
+            for key in cli.list(BUCKET, pref + "/"):
+                cli.delete(BUCKET, key)
+            print(f"  removed s3://{BUCKET}/{pref}/")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="build locally, print timeline, no upload")
-    ap.add_argument("--probe", action="store_true", help="upload 3 findings only, for schema discovery")
-    ap.add_argument("--wire", action="store_true", help="create the ES data source + datasets")
+    ap.add_argument("--probe", action="store_true", help="build 3 findings only, for schema discovery")
+    ap.add_argument("--wire", action="store_true", help="create the ES|QL data source + datasets")
+    ap.add_argument("--as-index", action="store_true", help="fallback: load the findings as plain indices")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--cleanup", action="store_true")
     ap.add_argument("--benign", type=int, default=200)
@@ -554,6 +599,8 @@ def main():
         return cleanup()
     if a.wire:
         return wire()
+    if a.as_index:
+        return as_index()
 
     if a.anchor == "auto" and not a.dry_run:
         discover_anchors()
@@ -587,7 +634,7 @@ def main():
         return
     print()
     upload()
-    print("\nNext: python3 guardduty_seed.py --wire   (needs GD_S3_ACCESS_KEY / GD_S3_SECRET)")
+    print("\nNext: python3 guardduty_seed.py --wire")
 
 
 if __name__ == "__main__":
