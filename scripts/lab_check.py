@@ -233,14 +233,27 @@ def learner_lab2():
     return f"{c['totalComment']} comment(s) on the case"
 
 
-def learner_lab3():
+DISCOVERY_INDICES = ".alerts-security.attack.discovery.alerts-*,.adhoc.alerts-security.attack.discovery.alerts-*"
+
+
+def stored_discoveries():
+    """Attack discoveries mentioning the crown jewel, read straight from the discovery indices.
+    The API returns only the calling user's discoveries, and the learner's Kibana user is not this key's user."""
+    s, r = es("POST", f"/{DISCOVERY_INDICES}/_search?expand_wildcards=all&ignore_unavailable=true&allow_no_indices=true",
+              {"size": 5, "query": {"bool": {"filter": [{"range": {"@timestamp": {"gte": "now-24h"}}}],
+                                             "must": [{"query_string": {"query": f'"{HERO}"'}}]}}})
+    if s == 200 and isinstance(r, dict):
+        return r.get("hits", {}).get("total", {}).get("value", 0)
     s, r = kb("GET", "/api/attack_discovery/_find?start=now-24h&end=now&per_page=50&sort_field=@timestamp&sort_order=desc")
-    ds = r.get("data", []) if s == 200 and isinstance(r, dict) else []
-    hero = [d for d in ds if HERO in json.dumps(d)]
-    assert hero, "No attack discovery mentions the crown jewel yet. Open Attacks → Settings, pick the VGI Opus connector, then Save and run."
+    return len([d for d in (r.get("data", []) if s == 200 and isinstance(r, dict) else []) if HERO in json.dumps(d)])
+
+
+def learner_lab3():
+    n = stored_discoveries()
+    assert n, "No attack discovery mentions the crown jewel yet. Open Attacks → Settings, pick the VGI Opus connector, then Save and run."
     c = find_case()
     assert c and c.get("totalAlerts", 0) >= 3, "Add the discovery to your case (its alerts should be attached)."
-    return f"{len(hero)} discovery(ies) about {HERO}; case has {c['totalAlerts']} alerts"
+    return f"{n} discovery(ies) about {HERO}; case has {c['totalAlerts']} alerts"
 
 
 def learner_lab4():

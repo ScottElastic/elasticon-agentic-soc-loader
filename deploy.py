@@ -410,13 +410,31 @@ def exposure():
     py("wiz_seed.py")
 
 
+def _publish_agent(agent_id):
+    """Agents can default to private (only their creator sees them). The learner's Kibana user is not the loader's."""
+    s_, a = kb("GET", f"/api/agent_builder/agents/{agent_id}")
+    ac = a.get("access_control") if isinstance(a, dict) else None
+    print(f"  agent {agent_id}: access_control = {ac}")
+    if ac is None:
+        ok("this Elastic version has no per-agent visibility setting: nothing to change")
+        return
+    if (ac or {}).get("access_mode") == "public":
+        ok(f"agent {agent_id} is already public")
+        return
+    s_, b = kb("PUT", f"/api/agent_builder/agents/{agent_id}", {"access_control": {"access_mode": "public"}})
+    s2, a2 = kb("GET", f"/api/agent_builder/agents/{agent_id}")
+    now = (a2.get("access_control") or {}).get("access_mode") if isinstance(a2, dict) else None
+    (ok if now == "public" else warn)(f"agent {agent_id} visibility -> {now} (PUT HTTP {s_}" + ("" if now == "public" else f": {str(b)[:200]}") + ")")
+
+
 def agent():
-    """GLaDOS: 6 AWS tools, the agent, 3 cross-domain tools, the re-skin, and the Wiz exposure tool."""
+    """GLaDOS: 6 AWS tools, the agent, 3 cross-domain tools, the re-skin, the Wiz exposure tool; made visible to learners."""
     py("glados_aws_tools.py")
     py("glados_agent.py")
     py("elasticon_tools.py")
     py("reskin_glados.py")
     py("wiz_tool.py")
+    _publish_agent("vgi-glados")
 
 
 def public_kibana_url():
