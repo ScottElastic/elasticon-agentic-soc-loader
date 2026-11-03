@@ -300,7 +300,7 @@ def campaign_findings():
         "An API was invoked using root credentials.",
         f"A console login using root credentials was observed from {ATTACKER_IP}, which is on a "
         f"threat intelligence list. MFA was not used.",
-        resource=iam_resource("root", "ASIAIOSFODNN7EXAMPLE"),
+        resource=iam_resource("root", "ASIAEXAMPLETEMPKEY"),
         action=api_action(ATTACKER_IP, "ConsoleLogin", "signin.amazonaws.com",
                           "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")))
 
@@ -309,7 +309,7 @@ def campaign_findings():
         "API commonly used to discover resources invoked from a known malicious IP address.",
         f"An API commonly used to discover the users and keys in an AWS account was invoked from "
         f"IP address {ATTACKER_IP}, which is on a threat intelligence list.",
-        resource=iam_resource("root", "ASIAIOSFODNN7EXAMPLE"),
+        resource=iam_resource("root", "ASIAEXAMPLETEMPKEY"),
         action=api_action(ATTACKER_IP, "ListUsers"), count=9))
 
     out.append(finding(
