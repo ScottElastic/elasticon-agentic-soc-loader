@@ -61,6 +61,6 @@ assets/, workflows/       rule set, case template, observable types; the TARS an
 
 ## Notes
 
-- Tested on Elastic 9.5.2. MOTHER's definition uses the `ai.agent` workflow step, which that release rejects, so she
-  stays disabled there; it should work on a newer version.
+- Tested on Elastic 9.5.2. That release caps a literal case title at 160 characters, so MOTHER builds hers in a
+  `data.set` step first (the rendered title is unchanged).
 - The generators are readable on purpose, which means the investigation's answers are readable too. Do the labs first.

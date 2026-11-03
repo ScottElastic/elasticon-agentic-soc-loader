@@ -196,8 +196,8 @@ def _():
     m = by.get(MOTHER, {})
     if m.get("enabled"):
         return "TARS and MOTHER enabled"
-    # MOTHER uses the `ai.agent` step (newer than 9.5.x): not a blocker, the labs that need her say so.
-    return f"TARS enabled; MOTHER is NOT (valid={m.get('valid')}): needs a newer Elastic version"
+    # MOTHER is not a blocker for the labs that do not open her execution.
+    return f"TARS enabled; MOTHER is NOT (valid={m.get('valid')})"
 
 
 LAB_ENV = {
@@ -214,6 +214,8 @@ def find_case(search=CASE_SEARCH):
     q = urllib.parse.urlencode({"search": search, "searchFields": "title", "perPage": 20, "sortField": "createdAt", "sortOrder": "desc"})
     s, b = kb("GET", f"/api/cases/_find?{q}")
     cases = b.get("cases", []) if s == 200 and isinstance(b, dict) else []
+    if "DRILL" in search:                       # asked for the drill case itself
+        return next(iter(cases), None)
     return next((c for c in cases if "DRILL" not in c.get("title", "")), None)
 
 

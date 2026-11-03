@@ -444,6 +444,19 @@ def _deploy_workflow(path, name, subs=None):
     return None
 
 
+def _validator_messages(workflow_id):
+    """Kibana's own workflow validator (the Agent Builder tool) on the deployed YAML: the reason it is invalid."""
+    s_, g = kb("GET", f"/api/workflows/workflow/{workflow_id}")
+    yaml_text = g.get("yaml", "") if isinstance(g, dict) else ""
+    s_, r = kb("POST", "/api/agent_builder/tools/_execute",
+               {"tool_id": "platform.workflows.validate_workflow", "tool_params": {"yaml": yaml_text}})
+    try:
+        diags = r["results"][0]["data"]["result"].get("diagnostics", [])
+        return [f"{d.get('message')} (at {'.'.join(str(x) for x in d.get('path', []))})" for d in diags]
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return [f"validator unavailable (HTTP {s_})"]
+
+
 def _enable_workflow(name):
     """Workflows are created disabled. On 9.5.x `PUT {enabled: true}` turns them on (no UI step)."""
     w = _find_workflow(name)
@@ -461,6 +474,8 @@ def _enable_workflow(name):
         why = b if isinstance(b, str) else {k: b.get(k) for k in ("enabled", "valid", "validationErrors") if k in b}
         print(f"     response: {str(why)[:600]}")
         print(f"     workflow now: {str({k: (now or {}).get(k) for k in ('enabled', 'valid')})}")
+        for m in _validator_messages(w["id"])[:6]:
+            print(f"     validator: {m}")
 
 
 def workflows():
@@ -495,8 +510,8 @@ def mother_run():
     """Run MOTHER once so her latest execution exists when a learner opens Workflows (skipped if she is not enabled)."""
     w = _find_workflow(MOTHER_NAME)
     if not w or not w.get("enabled"):
-        warn(f"MOTHER is not enabled (valid={None if not w else w.get('valid')}): skipping her first run. "
-             "Her definition uses the `ai.agent` step, which needs a newer Elastic version than 9.5.x.")
+        warn(f"MOTHER is not enabled (valid={None if not w else w.get('valid')}): skipping her first run "
+             "(the validator's reason is printed by the workflows phase)")
         return
     s_, r = kb("POST", f"/api/workflows/workflow/{w['id']}/run", {"inputs": {}})
     ex = r.get("workflowExecutionId") if isinstance(r, dict) else None
@@ -599,8 +614,7 @@ def verify():
     if w and w.get("enabled"):
         ok("MOTHER enabled")
     else:
-        # Not a hard failure on 9.5.x: her `ai.agent` step is newer than that release (valid=false).
-        warn(f"MOTHER is not enabled (valid={None if not w else w.get('valid')}); labs that open her execution need a newer Elastic version")
+        warn(f"MOTHER is not enabled (valid={None if not w else w.get('valid')}); the lab that opens her execution will have none")
     return rc or fired
 
 

@@ -306,13 +306,20 @@ steps:
   # PHASE 4 — CASE
   # ===========================================================================
 
+  # Kibana 9.5 rejects a literal over 160 characters in a case title ("Too big ... steps.7.with.title"), and the Liquid
+  # template that builds this title is longer than that. The RENDERED title is unchanged: build it here, use it below.
+  - name: case_title
+    type: data.set
+    with:
+      title: "[Daily Threat Hunt] {{ 'now' | date: '%Y-%m-%d' }} — {{ steps.extract_verdict.output.structured_output.coverage_verdict | default: 'insufficient_coverage' }} — {{ steps.extract_verdict.output.structured_output.headline | default: 'IOC watchlist sweep' }}"
+
   - name: create_case
     type: cases.createCase
     with:
       # QA 2026-09-23: title used to take the LLM headline directly, which could claim
       # active C2 while the same run's report said NO THREATS DETECTED. It now leads
       # with the structured coverage_verdict, so title and body cannot disagree.
-      title: "[Daily Threat Hunt] {{ 'now' | date: '%Y-%m-%d' }} — {{ steps.extract_verdict.output.structured_output.coverage_verdict | default: 'insufficient_coverage' }} — {{ steps.extract_verdict.output.structured_output.headline | default: 'IOC watchlist sweep' }}"
+      title: "{{ steps.case_title.output.title }}"
       description: |
         **Automated daily threat hunt** (24-hour schedule) — IOC watchlist sweep across
         all Vandelay Global Industries log data (Palo Alto firewall, CrowdStrike Falcon, AWS, Kubernetes,
