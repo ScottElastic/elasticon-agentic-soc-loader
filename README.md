@@ -1,71 +1,66 @@
-> **Work in progress.** This is the data and detection loader for the *GLaDOS vs. Skynet: Build the Agentic SOC*
-> workshop, being ported to run inside an Instruqt sandbox (Elastic 9.5.x on ECK). The instructions below still
-> describe the original Serverless/ECH flow and will change. All data is synthetic and fictional; there are no
-> credentials in this repo, and none should ever be added (`env.sh` is git-ignored).
+# GLaDOS vs. Skynet: workshop loader
 
-# seed-kit — stand up and reseed the crown-jewel workshop
+Synthetic data, detections, an AI agent and workflows for the **GLaDOS vs. Skynet: Build the Agentic SOC**
+hands-on workshop (Elastic Security). It runs inside an Instruqt sandbox on Elastic **9.5.x** (ECK on k3s) and
+loads one fictional intrusion at a fictional conglomerate into **your own cluster**.
 
-Everything needed to put the workshop's data, detections, agent, workflows and case setup onto an
-Elastic cluster (ECH or Serverless) and to reseed it before each session. It is self-contained:
-Python 3.9+ stdlib, no `pip install`, plus the AWS CLI for the S3 archive. The guide itself lives
-one folder up and is not needed to seed.
+Everything here is fictional and synthetic. There are no credentials in this repository, and none should ever be
+added: `env.sh` (the only file that holds a key) is git-ignored and is created on your sandbox, for your sandbox.
+
+## Run it (in the Instruqt sandbox)
 
 ```bash
-cd seed-kit
-cp env.example env.sh && $EDITOR env.sh     # cluster URL + API key, S3 bucket + reader key
-source env.sh
-python3 deploy.py check      # changes nothing
-python3 deploy.py setup      # once per cluster, then enable MOTHER in the Workflows UI
-python3 deploy.py seed       # every session, 1–24 h before doors
-python3 deploy.py verify     # exit 0 = go
+git clone --depth 1 --branch <tag> https://github.com/ScottElastic/elasticon-agentic-soc-loader.git soc
+cd soc
+./start.sh          # creates a key that works only on your cluster, then starts two background jobs
+./soc-status        # what is done, running or failed
 ```
 
-Start with **[CHECKLIST.md](CHECKLIST.md)**: some switches are UI-only and must be on before data
-arrives. `CLAUDE.md` is the short version for Claude Code.
+The jobs keep running if you close the terminal or move to the next challenge. `./start.sh` is safe to run again:
+it resumes a job that failed and never restarts one that is running.
+
+The sandbox's setup script (root) does the few things that need privileges, once, before you start:
+the cluster CA, the LLM connectors, the S3 server, and the systemd units that run these jobs **as you**. You never
+need `sudo`, and nothing here runs as root.
+
+## What it builds
+
+| Job | Phase | What it does | ~min |
+|---|---|---|---|
+| pipeline | integrations | Fleet packages and the prebuilt detection-rules package | 4 |
+| | baseline, templates, entity | 30 days of normal activity, index templates, Entity Store, asset criticality | <1 |
+| | rules, ml | the story's detection rules; machine-learning jobs on the auth logs | 2 |
+| | campaign | last night's attack, relative to now; waits for the rules to fire | 5 |
+| | hunt, fp-history | the overnight-hunt data; a month of closed false positives for Alert analysis | 5 |
+| | guardduty | the GuardDuty archive, read in place by ES\|QL data federation | <1 |
+| agentic | llm *(prepared by setup)* | connectors `vgi-opus` / `vgi-sonnet`; inference endpoints for ES\|QL `COMPLETION` | <1 |
+| | cases, roles | the case template (a SOC playbook) and custom observable types; roles | <1 |
+| | exposure | Wiz vulnerability and misconfiguration data, and the asset-exposure lookup | 5 |
+| | agent, workflows | the GLaDOS agent and its tools; the TARS and MOTHER workflows | <1 |
+
+The core (alerts, LLMs, case template) is ready about **10 minutes** after `./start.sh`; everything is done in about
+15 (measured on the managed Elastic sandbox).
+
+## How federation works with no credentials
+
+The GuardDuty export lives on an S3-compatible server (SeaweedFS) that the sandbox runs next to Elasticsearch.
+Elasticsearch reads it through `http://s3.default.svc:9000` with `auth: none`, so there is no key to leak. If that
+server cannot start, the same findings are loaded as a plain index with the same name, and the queries do not change.
 
 ## Layout
 
 ```
-deploy.py              orchestrator: check · setup (15 phases) · seed (4) · verify   (--only / --from / --list)
-env.example            copy to env.sh (never commit or share env.sh)
-CHECKLIST.md           what to switch on, in order, ECH and Serverless
-scripts/
-  crownjewel_seed.py   the campaign, relative to now (+ competing lead 1, criticality check, ML relearn)
-  guardduty_seed.py    GuardDuty archive → S3, pinned to the seeded CloudTrail events; --wire = ES|QL federation
-  fp_rds_export.py     the benign RDS export (Lab 4/5 lead 2) + 28 nights of closed-FP history
-  wiz_seed.py          Wiz vulns + misconfigs, transforms, vgi-asset-exposure lookup index
-  glados_aws_tools.py  GLaDOS's 6 AWS tools            glados_agent.py   the agent
-  elasticon_tools.py   3 cross-domain tools            reskin_glados.py  GLaDOS persona + tool wiring
-  wiz_tool.py          vgi.asset.exposure tool         create_roles.py   attendee / facilitator roles
-  case_setup.py        case template + custom observable types (from assets/)
-workflows/             TARS (attendee-safe response) · MOTHER (daily IOC hunt)
-generator/             vgi_sim: ECS-shaped event emitters, 30-day baseline, MOTHER's hunt scenario (run.py)
-assets/                required-rules.json · custom rule · case-template.json · observable-types.json
+start.sh, soc-status      the learner's entry points
+deploy.py                 the orchestrator: lanes, phases, resume, status, verify (see its docstring)
+scripts/sandbox_*.py      cluster discovery + key, LLM setup, S3 server, root-only prep
+scripts/lab_check.py      per-lab data-readiness gates and learner checks used by the track
+scripts/*_seed.py ...     the campaign, GuardDuty archive, Wiz data, false positives, GLaDOS agent and tools
+generator/                ECS-shaped event emitters and the 30-day baseline
+assets/, workflows/       rule set, case template, observable types; the TARS and MOTHER workflows
 ```
 
-`assets/case-template.json` and `observable-types.json` are generated by `../build_walkthrough.py`
-from the guide. Rebuild the guide after changing the playbook, then re-run `deploy.py setup --only cases`.
+## Notes
 
-## The cast in the data
-
-| Who | Account | Role in the story |
-|---|---|---|
-| Conan's deploy account | `svc-conan-deploy` | its SSH key is stolen from K8s and used on the crown jewel |
-| T-800 CI identity | `svc-t800-ci` | AWS IAM user the attacker creates keys for, then uses in K8s |
-| Nedry's backdoor | `whte_rbt` | local account created as root after CVE-2025-32463 |
-| John Kimble · Jack Slater · Howard Langston · Douglas Quaid | `j.kimble` `j.slater` `h.langston` `d.quaid` | the admins with weeks of normal key logins (Howard loses his MFA) |
-| Victor Fries | `v.fries` | the insider persona (take-home material) |
-| Dutch Schaefer | `dutch.schaefer` | closes the RDS false positives, night after night |
-
-Hosts: `gridvault-usw2-01` (the crown jewel), `gridvault-usw2-02/03`, `gridvault-bastion-usw2-01`,
-`VGI-LT-4471` (MOTHER's beaconing laptop), `elasticon` (competing lead 1). Attacker `203.0.113.66`,
-scanner `198.51.100.23`, AWS account `847629103455`.
-
-## Easter eggs (all in the seeded data)
-
-- SSH key fingerprint `SHA256:JudgmentDay1997Aug29…` (T2's Judgment Day).
-- `sh -c echo "ah ah ah, you didn't say the magic word" > /home/whte_rbt/.plan` (Jurassic Park).
-- C2 beacon `https://203.0.113.66/wopr/shall-we-play-a-game`; Palo Alto threat *Cyberdyne T-800 C2* (WarGames, Terminator).
-- WAF request from the scanner with user agent `WOPR/1.0 (Global Thermonuclear War)`.
-- The compromised pod is `flux-capacitor-svc`; the RBAC binding is `cluster-admin-for-the-greater-good`.
-- Jack Slater logs in to the crown jewel at exactly **13:37:00**, two days before the attack (30-day rollup).
+- Tested on Elastic 9.5.2. MOTHER's definition uses the `ai.agent` workflow step, which that release rejects, so she
+  stays disabled there; it should work on a newer version.
+- The generators are readable on purpose, which means the investigation's answers are readable too. Do the labs first.

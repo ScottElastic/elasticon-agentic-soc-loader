@@ -187,13 +187,17 @@ def _():
     return f"{rows[0]['n']} closed alerts"
 
 
-@env_check("TARS and MOTHER enabled")
+@env_check("TARS enabled (MOTHER when the version supports her)")
 def _():
     s, wl = kb("GET", "/api/workflows?size=100")
     res = wl.get("results", []) if s == 200 and isinstance(wl, dict) else []
-    on = {w["name"].split(" ")[0]: w.get("enabled") for w in res}
-    assert on.get(TARS) and on.get(MOTHER), f"workflow state: {on}"
-    return "both enabled"
+    by = {w["name"].split(" ")[0]: w for w in res}
+    assert by.get(TARS, {}).get("enabled"), f"TARS is not enabled: {sorted(by)}"
+    m = by.get(MOTHER, {})
+    if m.get("enabled"):
+        return "TARS and MOTHER enabled"
+    # MOTHER uses the `ai.agent` step (newer than 9.5.x): not a blocker, the labs that need her say so.
+    return f"TARS enabled; MOTHER is NOT (valid={m.get('valid')}): needs a newer Elastic version"
 
 
 LAB_ENV = {
@@ -201,7 +205,7 @@ LAB_ENV = {
     "lab2": ["auth logs for the hero host (30 days)", "machine-learning alert", "asset exposure lookup", "ES|QL COMPLETION endpoint"],
     "lab3": ["Kubernetes secret read", "GuardDuty archive (federation)", "LLM connectors"],
     "lab4": ["GLaDOS agent", "competing lead 1 (endpoint)", "closed RDS false-positive history"],
-    "lab5": ["TARS and MOTHER enabled", "closed RDS false-positive history"],
+    "lab5": ["TARS enabled (MOTHER when the version supports her)", "closed RDS false-positive history"],
 }
 
 
@@ -244,15 +248,12 @@ def learner_lab4():
 
 
 def learner_lab5():
-    s, wl = kb("GET", "/api/workflows?size=100")
-    tars = next((w for w in (wl.get("results", []) if s == 200 else []) if w["name"].startswith(TARS)), None)
-    assert tars, "TARS workflow not found."
-    s, ex = kb("GET", f"/api/workflows/executions?workflowId={tars['id']}&size=5")
-    runs = ex.get("results", []) if s == 200 and isinstance(ex, dict) else []
-    assert runs, "Run the TARS workflow (Workflows → TARS → Run → Manual) first."
+    """TARS ran: its [DRILL] case exists and carries both the host and the IP it was given."""
     drill = find_case("DRILL")
-    assert drill, "TARS ran but I can't find its [DRILL] case; open Cases and check."
-    return f"{len(runs)} TARS run(s); case '{drill['title'][:60]}'"
+    assert drill, "Run the TARS workflow (Workflows → TARS → Run → Manual); it opens a [DRILL] case when it finishes."
+    title = drill.get("title", "")
+    assert HERO in title and ATTACKER in title, f"The [DRILL] case title is missing your inputs: '{title[:90]}'. Run TARS again with the host and IP filled in."
+    return f"TARS ran; case '{title[:70]}'"
 
 
 LEARNER = {"lab1": learner_lab1, "lab2": learner_lab2, "lab3": learner_lab3, "lab4": learner_lab4, "lab5": learner_lab5}

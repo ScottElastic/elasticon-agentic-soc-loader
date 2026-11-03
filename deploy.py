@@ -298,7 +298,7 @@ def entity():
             s, b = kb("POST", "/api/security/entity_store/install", {})
         s = 200 if s == 201 else s
         (ok if s == 200 else warn)(f"Entity Store enable: HTTP {s} {'' if s == 200 else str(b)[:160]}"
-                                   + ("" if s == 200 else " — enable it in the UI (CHECKLIST §2)"))
+                                   + ("" if s == 200 else " — it can be enabled in Security → Manage → Entity Analytics"))
     for host, level in (("gridvault-usw2-01", "extreme_impact"), ("VGI-LT-4471", "high_impact"),
                         ("gridvault-bastion-usw2-01", "high_impact")):
         s, b = kb("POST", "/api/asset_criticality", {"id_field": "host.name", "id_value": host,
@@ -491,6 +491,28 @@ def workflows():
     (ok if s == 200 else fail)(f"Alert analysis attached to '{RDS_RULE}' (HTTP {s})")
 
 
+def mother_run():
+    """Run MOTHER once so her latest execution exists when a learner opens Workflows (skipped if she is not enabled)."""
+    w = _find_workflow(MOTHER_NAME)
+    if not w or not w.get("enabled"):
+        warn(f"MOTHER is not enabled (valid={None if not w else w.get('valid')}): skipping her first run. "
+             "Her definition uses the `ai.agent` step, which needs a newer Elastic version than 9.5.x.")
+        return
+    s_, r = kb("POST", f"/api/workflows/workflow/{w['id']}/run", {"inputs": {}})
+    ex = r.get("workflowExecutionId") if isinstance(r, dict) else None
+    if not ex:
+        warn(f"could not start MOTHER (HTTP {s_}): {str(r)[:200]}")
+        return
+    status = ""
+    for _ in range(60):                               # up to ~10 min
+        time.sleep(10)
+        s_, e = kb("GET", f"/api/workflows/executions/{ex}")
+        status = e.get("status", "") if isinstance(e, dict) else ""
+        if status in ("completed", "failed", "cancelled", "timed_out"):
+            break
+    (ok if status == "completed" else warn)(f"MOTHER first run {ex[:8]}…: {status or 'unknown'}")
+
+
 def cases():
     """The case template (SOC playbook) and the custom observable types."""
     py("case_setup.py")
@@ -570,10 +592,15 @@ def verify():
         n = b["values"][0][0] if s_ == 200 and b.get("values") else 0
         (ok if n else fail)(f"{label}: {n}")
         rc |= not n
-    for name in (TARS_NAME, MOTHER_NAME):
-        w = _find_workflow(name)
-        (ok if w and w.get("enabled") else fail)(f"{name.split(' — ')[0]} {'enabled' if w and w.get('enabled') else 'missing or DISABLED'}")
-        rc |= not (w and w.get("enabled"))
+    w = _find_workflow(TARS_NAME)
+    (ok if w and w.get("enabled") else fail)(f"TARS {'enabled' if w and w.get('enabled') else 'missing or DISABLED'}")
+    rc |= not (w and w.get("enabled"))
+    w = _find_workflow(MOTHER_NAME)
+    if w and w.get("enabled"):
+        ok("MOTHER enabled")
+    else:
+        # Not a hard failure on 9.5.x: her `ai.agent` step is newer than that release (valid=false).
+        warn(f"MOTHER is not enabled (valid={None if not w else w.get('valid')}); labs that open her execution need a newer Elastic version")
     return rc or fired
 
 
@@ -603,12 +630,13 @@ LANES = {
                  ("entity", entity), ("baseline", baseline), ("rules", rules), ("ml", ml),
                  ("campaign", campaign), ("hunt", hunt), ("fp-history", fp_history), ("guardduty", guardduty)],
     "agentic": [("llm", llm), ("cases", cases), ("roles", roles), ("federation", federation),
-                ("exposure", exposure), ("agent", agent), ("workflows", workflows)],
+                ("exposure", exposure), ("agent", agent), ("workflows", workflows), ("mother-run", mother_run)],
 }
 NEEDS = {
     "exposure": ["integrations"],            # both install Fleet packages: don't do it at the same time
     "agent": ["baseline", "exposure"],       # tools reference the data streams + the exposure lookup index
     "workflows": ["llm", "rules"],           # Alert analysis attaches to a rule
+    "mother-run": ["workflows", "hunt"],     # her first run needs the hunt data
     "guardduty": ["campaign", "federation"], # the archive is pinned to the seeded CloudTrail events
     "fp-history": ["rules"],
 }

@@ -70,7 +70,7 @@ DEPLOY_SECRET = "gridvault-deploy-ssh"
 KEY_FP = "ED25519 SHA256:JudgmentDay1997Aug29q3Vx8pK2mN7dRf4LwT9hZc1"   # the stolen deploy key (T2: 29 Aug 1997)
 SUDO_VER = "1.9.15p5"                    # matches the Wiz finding; CVE-2025-32463 fixed in 1.9.17p1
 WORKDIR = "/tmp/.woot"
-# Easter eggs, all in the data (see CLAUDE.md for the list)
+# Easter eggs, all in the data (see the constants below)
 C2_PATH = "/wopr/shall-we-play-a-game"                       # WarGames
 C2_THREAT = "Cyberdyne T-800 C2 — Spyware Command and Control Traffic"
 SCANNER_UA = "WOPR/1.0 (Global Thermonuclear War)"
