@@ -1,0 +1,252 @@
+# =============================================================================
+# ElastiCon — TARS: Attendee Safe Response (SIMULATED containment)
+# =============================================================================
+# The hands-on "click Respond" workflow for attendees. It feels like the real
+# thing — gathers endpoint + cloud evidence, runs a real AI triage, and files a
+# real Kibana case — but containment is SIMULATED: it makes NO HTTP call and
+# carries NO stored admin key, so running it can never isolate the live host.
+# (The real isolate is the facilitator's job in Lab 5, gated behind approval.)
+#
+# -----------------------------------------------------------------------------
+# REVISION 2026-09-23 — fixes found in end-to-end QA:
+#   1. INPUTS MOVED UNDER THE MANUAL TRIGGER. A root-level `inputs:` block is
+#      silently DROPPED by the parser (the stored definition had no `inputs`
+#      key at all), so context.inputs was {} and every bare {{ inputs.* }}
+#      rendered empty — blank case title, "unspecified" in the triage, and a
+#      proposal to isolate an empty target. Verified: only `triggers[].inputs`
+#      survives parsing.
+#   2. EXPLICIT UTC WINDOW. Both queries used relative windows (24 hours / 14
+#      days) that did not cover the September 18 investigation hour, so a green
+#      run could investigate the wrong dates entirely. Window is now an input
+#      and both queries are bounded by it.
+#   3. READABLE EVIDENCE. Raw ES|QL value arrays interpolated into an unreadable
+#      flattened string. Each query now builds a pre-formatted `line` column in
+#      ES|QL, so the case comment is legible whatever the templating does.
+#   4. INSUFFICIENT EVIDENCE IS A VALID VERDICT. The prompt forced TRUE/FALSE
+#      POSITIVE even with no evidence.
+#   5. EMPTY TARGETS ARE VISIBLE. Every interpolation still carries an inline
+#      `| default:` so a missed input degrades loudly to the documented fixture
+#      rather than to an empty string.
+#
+# REVISION 2026-09-28:
+#   6. RELATIVE WINDOW. window_start/window_end (explicit UTC timestamps) are replaced by
+#      lookback_days (default 7): the prefilled dates went stale after every reseed, and a
+#      session that crossed midnight UTC could miss the attack. `NOW() - N days` cannot.
+#   7. ATTACH-TO-OPEN-CASE step, COMMENTED OUT. See `find_open_cases` below: it would
+#      comment on any open case already carrying this host. Left off for the workshop so
+#      a room of attendees does not write into each other's cases.
+# =============================================================================
+version: "1"
+name: "TARS — Attendee Safe Response (Simulated Containment)"
+description: >
+  Attendee-safe response playbook: gathers evidence over the last N days (lookback_days),
+  runs AI triage, files a case, and SIMULATES host containment (no real action).
+  Safe for a room full of people to run against the shared cluster.
+enabled: true
+tags: ["elasticon", "attendee-safe", "tars", "simulated"]
+
+consts:
+  sonnet: "Anthropic-Claude-Sonnet-4-5"
+
+triggers:
+  # NOTE: inputs MUST live here, not at the document root — see revision note 1.
+  - type: manual
+    inputs:
+      - name: alert_host
+        type: string
+        required: false
+        default: "gridvault-usw2-01"
+        description: "Host to investigate (default: the compromised grid backend)"
+      - name: attacker_ip
+        type: string
+        required: false
+        default: "203.0.113.66"
+        description: "Attacker IP to correlate"
+      - name: lookback_days
+        type: number
+        required: false
+        default: 7
+        description: "How many days back the evidence queries look (default 7 — covers the attack whenever you run it)"
+  - type: alert
+
+steps:
+  # ── 1. Evidence: alerts on the host, inside the supplied window ─────────────
+  - name: get_alerts
+    type: elasticsearch.esql.query
+    with:
+      format: json
+      query: |
+        FROM .alerts-security.alerts-default
+        | WHERE host.name == "{{ inputs.alert_host | default: 'gridvault-usw2-01' }}"
+          AND `@timestamp` >= NOW() - {{ inputs.lookback_days | default: 7 }} days
+        | EVAL line = CONCAT(
+            DATE_FORMAT("yyyy-MM-dd HH:mm:ss", `@timestamp`), " UTC  ",
+            kibana.alert.severity, "  ", kibana.alert.rule.name)
+        | KEEP line
+        | SORT line ASC
+        | LIMIT 25
+    on-failure:
+      continue: true
+
+  # ── 2. Evidence: where else the attacker IP appears, same window ────────────
+  - name: correlate_ip
+    type: elasticsearch.esql.query
+    with:
+      format: json
+      query: |
+        FROM logs-*
+        | WHERE (source.ip == "{{ inputs.attacker_ip | default: '203.0.113.66' }}"
+                 OR destination.ip == "{{ inputs.attacker_ip | default: '203.0.113.66' }}")
+          AND `@timestamp` >= NOW() - {{ inputs.lookback_days | default: 7 }} days
+        | STATS events = COUNT(*), hosts = VALUES(host.name) BY data_stream.dataset
+        | EVAL line = CONCAT(data_stream.dataset, "  —  ", TO_STRING(events),
+                             " events  hosts=", MV_CONCAT(hosts, ","))
+        | KEEP line
+        | SORT line ASC
+        | LIMIT 25
+    on-failure:
+      continue: true
+
+  # ── 3. Real AI triage (Sonnet — fast + cheap) ───────────────────────────────
+  - name: triage
+    type: ai.prompt
+    connector-id: "Anthropic-Claude-Sonnet-4-5"
+    with:
+      prompt: |
+        You are a SOC analyst at Vandelay Global Industries. Triage this in <= 150 words.
+
+        Target host : {{ inputs.alert_host | default: 'gridvault-usw2-01' }}
+        Attacker IP : {{ inputs.attacker_ip | default: '203.0.113.66' }}
+        Window      : the last {{ inputs.lookback_days | default: 7 }} days
+
+        Give:
+        **Verdict** — one of TRUE POSITIVE / FALSE POSITIVE / INSUFFICIENT EVIDENCE,
+        plus one clause of justification. Choose INSUFFICIENT EVIDENCE when the
+        evidence below is empty or does not support either conclusion; do not
+        guess to avoid it.
+        **What happened** — up to 3 bullets, each citing a timestamp from the
+        evidence. Do not state a cause you cannot point at.
+        **MITRE** — technique ids, or "none supported".
+        **Recommended containment** — what you WOULD do. This is a drill.
+
+        If the evidence sections are empty, say so explicitly and recommend
+        confirming the host, IP and window before acting.
+
+        === Alerts on host, in window ===
+        {{ steps.get_alerts.output.values | default: "(no alerts returned for this host and window)" }}
+        === Attacker IP across all data sources, in window ===
+        {{ steps.correlate_ip.output.values | default: "(no correlation hits for this IP and window)" }}
+    on-failure:
+      continue: true
+
+  # ── 4. Real case ────────────────────────────────────────────────────────────
+  - name: create_case
+    type: cases.createCase
+    with:
+      title: "[DRILL] Attendee response — {{ inputs.alert_host | default: 'gridvault-usw2-01' }} ({{ inputs.attacker_ip | default: '203.0.113.66' }})"
+      description: |
+        **Training drill — simulated containment.** You ran the response playbook.
+
+        | | |
+        |---|---|
+        | Target host | `{{ inputs.alert_host | default: 'gridvault-usw2-01' }}` |
+        | Attacker IP | `{{ inputs.attacker_ip | default: '203.0.113.66' }}` |
+        | Window | last `{{ inputs.lookback_days | default: 7 }}` days |
+
+        Evidence gathered over that window, AI triage attached below, containment
+        **SIMULATED — no host was touched.**
+      tags: ["elasticon", "attendee-safe", "drill"]
+      severity: high
+      owner: securitySolution
+      settings:
+        syncAlerts: false
+    on-failure:
+      continue: true
+
+  - name: post_triage
+    type: cases.addComment
+    with:
+      case_id: "{{ steps.create_case.output.case.id }}"
+      comment: |
+        ## AI Triage (Sonnet)
+        _Window: the last {{ inputs.lookback_days | default: 7 }} days_
+
+        {{ steps.triage.output.content | default: "_(triage unavailable)_" }}
+
+        > An AI verdict is a lead. Check it against the source records before you act on it.
+    on-failure:
+      continue: true
+
+  - name: post_evidence
+    type: cases.addComment
+    with:
+      case_id: "{{ steps.create_case.output.case.id }}"
+      comment: |
+        ## Evidence — alerts on `{{ inputs.alert_host | default: 'gridvault-usw2-01' }}`
+        ```
+        {{ steps.get_alerts.output.values | default: "(none in window)" }}
+        ```
+        ## Evidence — every data source touched by `{{ inputs.attacker_ip | default: '203.0.113.66' }}`
+        ```
+        {{ steps.correlate_ip.output.values | default: "(none in window)" }}
+        ```
+        _Both queries look back the number of days in the case description.
+        An empty section means nothing matched that window — not that nothing happened._
+    on-failure:
+      continue: true
+
+  # ── 4b. Link to any case already open for this host — DISABLED for the workshop ──
+  # Uncomment to have the playbook comment on every OPEN case that already mentions the host
+  # (e.g. the analyst's own investigation), instead of only filing its own [DRILL] case.
+  # Off in the workshop: with 30 tables on one cluster, each run would write into every
+  # other table's case.
+  #
+  # - name: find_open_cases
+  #   type: kibana.request
+  #   with:
+  #     method: GET
+  #     path: "/api/cases/_find?status=open&owner=securitySolution&search={{ inputs.alert_host | default: 'gridvault-usw2-01' }}&searchFields=title&searchFields=description&perPage=20"
+  #   on-failure:
+  #     continue: true
+  #
+  # - name: link_open_cases
+  #   type: foreach
+  #   foreach: "{{ steps.find_open_cases.output.cases }}"
+  #   steps:
+  #     - name: comment_on_open_case
+  #       type: cases.addComment
+  #       with:
+  #         case_id: "{{ foreach.item.id }}"
+  #         comment: |
+  #           **TARS ran against `{{ inputs.alert_host | default: 'gridvault-usw2-01' }}`**
+  #           ({{ inputs.attacker_ip | default: '203.0.113.66' }}, last {{ inputs.lookback_days | default: 7 }} days).
+  #           Drill case with the evidence and AI triage: {{ steps.create_case.output.case.id }}
+  #       on-failure:
+  #         continue: true
+
+  # ── 5. SIMULATED containment (no real action) ───────────────────────────────
+  - name: simulated_containment
+    type: cases.addComment
+    with:
+      case_id: "{{ steps.create_case.output.case.id }}"
+      comment: |
+        ## 🧪 Simulated Containment
+        In production this step would **isolate `{{ inputs.alert_host | default: 'gridvault-usw2-01' }}`**
+        via Elastic Defend.
+
+        In this drill it is simulated — **no host was isolated.** The real isolate is
+        run once, live, by the facilitator in Lab 5, gated behind human approval.
+
+        If the host name above is not the one you intended to investigate, stop and
+        re-run with the correct target rather than acting on this result.
+    on-failure:
+      continue: true
+
+  - name: done
+    type: console
+    with:
+      message: |
+        Attendee-safe response complete (SIMULATED containment — no host touched).
+        Host: {{ inputs.alert_host | default: 'gridvault-usw2-01' }}
+        Window: last {{ inputs.lookback_days | default: 7 }} days
+        Case: {{ steps.create_case.output.case.id | default: "n/a" }}

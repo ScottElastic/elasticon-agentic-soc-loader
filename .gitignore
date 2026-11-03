@@ -1,0 +1,4 @@
+env.sh
+scripts/.gd_stage/
+scripts/.wiz_seed_manifest.json
+__pycache__/

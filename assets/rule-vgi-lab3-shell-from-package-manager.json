@@ -1,0 +1,47 @@
+{
+  "rule_id": "vgi-lab3-shell-from-package-manager",
+  "name": "Shell Spawned by Package Manager",
+  "description": "A shell interpreter was launched as a child of the system package manager. Post-install and update hooks do this legitimately; attackers also use package-manager hooks for execution and persistence. Inspect the process ancestry and the command line before deciding. Lab 3 fixture: real Elastic Defend telemetry, full process tree available in Analyzer.",
+  "type": "query",
+  "language": "kuery",
+  "query": "event.type:\"start\" and process.parent.name:\"apt-get\" and process.name:(\"dash\" or \"sh\" or \"bash\")",
+  "index": [
+    "logs-endpoint.events.process-*"
+  ],
+  "interval": "10m",
+  "from": "now-90d",
+  "severity": "medium",
+  "risk_score": 47,
+  "tags": [
+    "elasticon",
+    "vgi-lab3",
+    "endpoint",
+    "behavioral",
+    "fixture"
+  ],
+  "enabled": true,
+  "max_signals": 100,
+  "author": [
+    "VGI SOC"
+  ],
+  "threat": [
+    {
+      "framework": "MITRE ATT&CK",
+      "tactic": {
+        "id": "TA0002",
+        "name": "Execution",
+        "reference": "https://attack.mitre.org/tactics/TA0002/"
+      },
+      "technique": [
+        {
+          "id": "T1059",
+          "name": "Command and Scripting Interpreter",
+          "reference": "https://attack.mitre.org/techniques/T1059/"
+        }
+      ]
+    }
+  ],
+  "false_positives": [
+    "Package post-install and update-notifier hooks routinely spawn sh."
+  ]
+}

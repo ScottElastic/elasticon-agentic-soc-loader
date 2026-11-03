@@ -1,0 +1,106 @@
+[
+  {
+    "rule_id": "1aa8fa52-44a7-4dae-b058-f3333b91c8d7",
+    "name": "AWS CloudTrail Log Suspended"
+  },
+  {
+    "rule_id": "523116c0-d89d-4d7c-82c2-39e6845a78ef",
+    "name": "AWS GuardDuty Detector Deletion"
+  },
+  {
+    "rule_id": "d8fc1cca-93ed-43c1-bbb6-c0dd3eff2958",
+    "name": "AWS IAM Deactivation of MFA Device"
+  },
+  {
+    "rule_id": "696015ef-718e-40ff-ac4a-cc2ba88dbeeb",
+    "name": "AWS IAM User Created Access Keys For Another User"
+  },
+  {
+    "rule_id": "4d50a94f-2844-43fa-8395-6afbd5e1c5ef",
+    "name": "AWS Management Console Brute Force of Root User Identity"
+  },
+  {
+    "rule_id": "e2a67480-3b79-403d-96e3-fdd2992c50ef",
+    "name": "AWS Management Console Root Login"
+  },
+  {
+    "rule_id": "119c8877-8613-416d-a98a-96b6664ee73a",
+    "name": "AWS RDS Snapshot Export"
+  },
+  {
+    "rule_id": "41554afd-d839-4cc2-b185-170ac01cbefc",
+    "name": "AWS Sensitive IAM Operations Performed via CloudShell"
+  },
+  {
+    "rule_id": "63c057cc-339a-11ed-a261-0242ac120002",
+    "name": "Kubernetes Anonymous Request Authorized by Unusual User Agent"
+  },
+  {
+    "rule_id": "a2951930-dd35-438c-b10e-1bbdc5881cb4",
+    "name": "Kubernetes Cluster-Admin Role Binding Created"
+  },
+  {
+    "rule_id": "12cbf709-69e8-4055-94f9-24314385c27e",
+    "name": "Kubernetes Pod Created With HostNetwork"
+  },
+  {
+    "rule_id": "c7908cac-337a-4f38-b50d-5eeb78bdb531",
+    "name": "Kubernetes Privileged Pod Created"
+  },
+  {
+    "rule_id": "cbda9a0e-2be4-4eaa-9571-8d6a503e9828",
+    "name": "Kubernetes Secret Access via Unusual User Agent"
+  },
+  {
+    "rule_id": "a4c8e901-2b7f-4d6e-9a3c-8e1f0d5b6c2a",
+    "name": "Kubernetes Secret Get or List with Suspicious User Agent"
+  },
+  {
+    "rule_id": "14de811c-d60f-11ec-9fd7-f661ea17fbce",
+    "name": "Kubernetes User Exec into Pod"
+  },
+  {
+    "rule_id": "edfd5ca9-9d6c-44d9-b615-1e56b920219c",
+    "name": "Linux User Account Creation"
+  },
+  {
+    "rule_id": "43d6ec12-2b1c-47b5-8f35-e9de65551d3b",
+    "name": "Linux User Added to Privileged Group"
+  },
+  {
+    "rule_id": "283683eb-f2ce-40a5-be16-fa931cb5f504",
+    "name": "Newly Observed Palo Alto Network Alert"
+  },
+  {
+    "rule_id": "163a8f2f-c8a0-4b7e-9c4a-1184310eb7f3",
+    "name": "Potential CVE-2025-32463 Nsswitch File Creation"
+  },
+  {
+    "rule_id": "1d485649-c486-4f1d-a99c-8d64795795ad",
+    "name": "Potential CVE-2025-32463 Sudo Chroot Execution Attempt"
+  },
+  {
+    "rule_id": "8cb84371-d053-4f4f-bce0-c74990e28f28",
+    "name": "Potential Successful SSH Brute Force Attack"
+  },
+  {
+    "rule_id": "99dcf974-6587-4f65-9252-d866a3fdfd9c",
+    "name": "Spike in Failed Logon Events"
+  },
+  {
+    "rule_id": "5c495612-9992-49a7-afe3-0f647671fb60",
+    "name": "Successful SSH Authentication from Unusual IP Address"
+  },
+  {
+    "rule_id": "28d39238-0c01-420a-b77a-24e5a7378663",
+    "name": "Sudo Command Enumeration Detected"
+  },
+  {
+    "rule_id": "4330272b-9724-4bc6-a3ca-f1532b81e5c2",
+    "name": "Unusual Login Activity"
+  },
+  {
+    "rule_id": "d4b73fa0-9d43-465e-b8bf-50230da6718b",
+    "name": "Unusual Source IP for a User to Logon from"
+  }
+]

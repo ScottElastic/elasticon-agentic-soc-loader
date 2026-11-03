@@ -1,0 +1,441 @@
+# =============================================================================
+# MOTHER — Daily Threat Hunt: IOC Watchlist Sweep
+# =============================================================================
+# The VGI port of the Vibin "Axios threat hunt" demo. Every 24 hours (or on
+# demand) this workflow:
+#
+#   1. Reads the IOC watchlist from the vgi-threat-intel index (domains, IPs,
+#      hashes — seeded by `python generators/run.py scenario axios_c2`)
+#   2. Deterministically sweeps ALL log data streams for watchlist domains
+#      (PAN firewall url/destination.domain, CrowdStrike dns.question.name, …)
+#   3. Pivots matched domains to CrowdStrike FDR for HOST attribution
+#      (host.name / host.ip / agent id / user)
+#   4. Hands the hunt to the AI agent (platform.core.execute_esql) to chase
+#      every IOC type across logs-*, correlate firewall + endpoint evidence,
+#      and produce a decision-grade report + structured verdict
+#   5. Opens a Kibana case with the report, evidence links, and workspace
+#
+# Demo data: scenario axios_c2 — trojaned npm package on VGI-LT-4471 beaconing
+# to cdn.plain-crypto-js.dev through the PAN firewall (panw.panos) with
+# matching CrowdStrike DnsRequest / NetworkConnectIP4 / ProcessRollup2 docs.
+# =============================================================================
+name: "MOTHER — Daily Threat Hunt: IOC Watchlist Sweep"
+description: >
+  Scheduled 24h threat hunt. Reads the vgi-threat-intel IOC watchlist, sweeps all
+  log data for the indicators (Palo Alto firewall, CrowdStrike, cloud and system
+  logs), pivots matches to CrowdStrike FDR for host attribution, then delegates a
+  deep hunt to the AI agent. Files a case with the findings and a structured verdict.
+enabled: true
+tags:
+  - security
+  - threat-hunt
+  - threat-intel
+  - ioc-sweep
+  - panw
+  - crowdstrike
+  - automated-hunting
+  - SOC
+  - vgi
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+consts:
+  # QA 2026-09-23: was the OLD VGI tenant (my-security-project-dabe9a) — every pivot
+  # link sent attendees to a different cluster. Must match the tenant this runs on.
+  kibana_base_url: "https://elasticon-security-a4cec4.kb.us-central1.gcp.elastic.cloud"
+  logs_data_view_id: "logs-*"
+  investigation_dashboard_id: "vgi-investigation"
+  llm_connector: "Anthropic-Claude-Sonnet-4-5"
+  intel_index: "vgi-threat-intel"
+  # Hunt lookback lives in consts, NOT inputs: this engine build does not expose
+  # `inputs` to Liquid (workflowDefinition.inputs parses to null — verified), and the
+  # 24h scheduled trigger never passes inputs anyway.
+  lookback_hours: 24
+
+# =============================================================================
+# TRIGGERS — every 24 hours + on demand
+# =============================================================================
+triggers:
+  - type: scheduled
+    with:
+      every: "24h"
+  - type: manual
+
+# =============================================================================
+# STEPS
+# =============================================================================
+steps:
+
+  # ===========================================================================
+  # PHASE 1 — READ THE IOC WATCHLIST
+  # ===========================================================================
+
+  # Domain indicators drive the deterministic sweep (steps 3 + 4).
+  - name: get_watchlist
+    type: elasticsearch.esql.query
+    with:
+      format: json
+      query: |
+        FROM {{ consts.intel_index }}
+        | WHERE threat.indicator.type == "domain-name"
+        | KEEP threat.indicator.name, threat.software.name, threat.indicator.description
+        | LIMIT 25
+    on-failure:
+      continue: true
+
+  # Every indicator type — handed to the agent for the deep hunt.
+  - name: get_all_iocs
+    type: elasticsearch.esql.query
+    with:
+      format: json
+      query: |
+        FROM {{ consts.intel_index }}
+        | KEEP threat.indicator.type, threat.indicator.name, threat.indicator.description
+        | SORT threat.indicator.type
+        | LIMIT 50
+    on-failure:
+      continue: true
+
+  # ===========================================================================
+  # PHASE 2 — DETERMINISTIC IOC SWEEP ACROSS ALL LOG DATA
+  # Domain match across every data stream that carries a domain-ish field:
+  # panw.panos (url.domain / destination.domain), crowdstrike.fdr
+  # (dns.question.name), and anything else in logs-*.
+  # ===========================================================================
+
+  - name: sweep_domains
+    type: elasticsearch.esql.query
+    with:
+      format: json
+      query: |
+        FROM logs-*
+        | WHERE `@timestamp` > NOW() - {{ consts.lookback_hours }} hours
+        | EVAL matched_domain = COALESCE(url.domain, dns.question.name, destination.domain)
+        | WHERE matched_domain IN ("__no-iocs__.invalid"{% for row in steps.get_watchlist.output.values %}, "{{ row[0] }}"{% endfor %})
+        | STATS hits = COUNT(*),
+                first_seen = MIN(`@timestamp`), last_seen = MAX(`@timestamp`),
+                datasets = VALUES(data_stream.dataset),
+                source_ips = VALUES(source.ip),
+                hosts = VALUES(host.name),
+                users = VALUES(user.name)
+          BY matched_domain
+        | LIMIT 20
+    on-failure:
+      continue: true
+
+  # ── Host attribution: who resolved the malicious domain? (CrowdStrike FDR) ─
+  - name: crowdstrike_host_pivot
+    type: elasticsearch.esql.query
+    with:
+      format: json
+      query: |
+        FROM logs-crowdstrike.fdr-*
+        | WHERE `@timestamp` > NOW() - {{ consts.lookback_hours }} hours
+          AND dns.question.name IN ("__no-iocs__.invalid"{% for row in steps.get_watchlist.output.values %}, "{{ row[0] }}"{% endfor %})
+        | STATS dns_lookups = COUNT(*),
+                first_seen = MIN(`@timestamp`), last_seen = MAX(`@timestamp`),
+                host_ips = VALUES(host.ip),
+                agent_ids = VALUES(host.id),
+                os = VALUES(host.os.type)
+          BY host.name, dns.question.name
+        | LIMIT 20
+    on-failure:
+      continue: true
+
+  # ===========================================================================
+  # PHASE 3 — AI DEEP HUNT (default Agent Builder agent + execute_esql tools)
+  # ===========================================================================
+
+  - name: ai_hunt
+    type: ai.agent
+    connector-id: "{{ consts.llm_connector }}"
+    with:
+      message: |
+        You are running the DAILY THREAT HUNT for Vandelay Global Industries's SOC. Hunt the
+        environment for the IOC watchlist below using platform.core.execute_esql
+        (run real queries — do not fabricate results). Lookback: last
+        {{ consts.lookback_hours }} hours.
+
+        ## IOC WATCHLIST (from the {{ consts.intel_index }} index)
+        Rows are [indicator_type, indicator_value, description]:
+        {{ steps.get_all_iocs.output.values }}
+
+        ## WHAT THE DETERMINISTIC SWEEP ALREADY FOUND
+        Domain sweep across logs-* — rows are
+        [hits, first_seen, last_seen, datasets, source_ips, hosts, users, matched_domain]:
+        {{ steps.sweep_domains.output.values }}
+
+        CrowdStrike DNS pivot — rows are
+        [dns_lookups, first_seen, last_seen, host_ips, agent_ids, os, host.name, dns.question.name]:
+        {{ steps.crowdstrike_host_pivot.output.values }}
+
+        ## YOUR HUNT (use execute_esql; keep each query tight)
+        1. DOMAINS: confirm every watchlist domain across logs-* — check
+           url.domain, destination.domain, and dns.question.name. Include the
+           Palo Alto firewall view: FROM logs-panw.panos-* — both TRAFFIC beacons
+           (panw.panos.type == "TRAFFIC", destination.ip pivot) and THREAT alerts
+           (event.kind == "alert", panw.panos.threat.name, event.action).
+        2. IPs: hunt watchlist ipv4-addr indicators in destination.ip across
+           logs-panw.panos-* and logs-crowdstrike.fdr-*.
+        3. HASHES: hunt file-sha256 indicators in process.hash.sha256 across
+           logs-crowdstrike.fdr-* — this identifies the malicious PROCESS.
+        4. HOST ATTRIBUTION (the deliverable): for every matched host, pull from
+           CrowdStrike FDR: host.name, host.ip, host.id (Falcon agent id),
+           host.os.type, user.name, and the beaconing process (process.name,
+           process.command_line, process.hash.sha256, process.parent.name).
+        5. SCOPE: check whether ANY OTHER host resolved the domains or touched
+           the IPs/hashes (lateral spread), and whether the firewall BLOCKED or
+           ALLOWED the C2 sessions (event.action flow_terminated vs flow_denied).
+
+        ## REPORT (markdown, concise, evidence-cited)
+        - **Verdict** — THREATS DETECTED / NO THREATS DETECTED + one-line why
+        - **Timeline** — first_seen → last_seen of the intrusion, beacon cadence
+        - **Host attribution table** — host | ip | user | process | hash | falcon agent id
+        - **IOC match table** — indicator | type | where seen (dataset) | hits
+        - **Firewall posture** — did PAN allow or block the C2 traffic?
+        - **Recommended actions** — containment first (isolate host via
+          CrowdStrike, block domain/IP at the PAN firewall), then eradication
+        - **Gaps** — anything the data could not answer
+    on-failure:
+      continue: true
+
+  # ── Structured verdict for the case description + workspace links ──────────
+  # QA 2026-09-23: MOTHER reported "active C2 confirmed" in the title while its own
+  # report said NO THREATS DETECTED and deterministic evidence had zero matches, on
+  # telemetry that was five days stale. This step measures coverage FIRST, so the
+  # title and the verdict can both be derived from the same bounded evidence.
+  - name: coverage_check
+    type: elasticsearch.esql.query
+    with:
+      format: json
+      query: |
+        FROM logs-*
+        | STATS newest = MAX(`@timestamp`), events = COUNT(*)
+        | EVAL age_hours = DATE_DIFF("hours", newest, NOW())
+        | EVAL coverage = CASE(
+            events == 0, "NO DATA",
+            age_hours > 48, "STALE",
+            "FRESH")
+        | EVAL newest_utc = DATE_FORMAT("yyyy-MM-dd HH:mm:ss", newest)
+        | KEEP coverage, age_hours, newest_utc, events
+    on-failure:
+      continue: true
+
+  - name: extract_verdict
+    type: ai.agent
+    connector-id: "{{ consts.llm_connector }}"
+    with:
+      message: |
+        Summarize the threat hunt you just completed as a structured verdict.
+        Base every field ONLY on the deterministic evidence below.
+
+        RULES — these override your narrative impression:
+        • If the domain sweep and the host pivot are both empty, you MUST set
+          threats_detected=false. An empty sweep is not a detection.
+        • Telemetry coverage for this run is {{ steps.coverage_check.output.values | default: "unknown" }}
+          (coverage, age_hours, newest event UTC, event count).
+          If coverage is STALE or NO DATA, set threats_detected=false and make the
+          headline say coverage is insufficient — NOT that the environment is clean,
+          and NOT that a threat is active. Zero hits on stale data resolves nothing.
+        • The headline must match threats_detected. Never headline an active threat
+          while threats_detected is false.
+        • Event dates in the evidence are the dates the activity occurred. Do not
+          describe an older event as ongoing just because this hunt ran today.
+
+        Domain sweep hits : {{ steps.sweep_domains.output.values | default: "(none)" }}
+        Host pivot hits   : {{ steps.crowdstrike_host_pivot.output.values | default: "(none)" }}
+      schema:
+        type: object
+        properties:
+          threats_detected:
+            type: boolean
+            description: >
+              True ONLY if a watchlist IOC actually matched environment data in this
+              run. Must be false when the sweeps are empty or coverage is STALE/NO DATA.
+          coverage_verdict:
+            type: string
+            enum: [confirmed_activity, no_matches_fresh_data, insufficient_coverage]
+            description: >
+              confirmed_activity = IOC matched. no_matches_fresh_data = clean sweep on
+              FRESH telemetry. insufficient_coverage = telemetry STALE/NO DATA, so this
+              run resolves nothing either way.
+          headline:
+            type: string
+            description: One line (<20 words) summarizing the finding.
+          severity:
+            type: string
+            enum: [critical, high, medium, low, informational]
+            description: Severity of the confirmed activity.
+          matched_iocs:
+            type: array
+            items:
+              type: string
+            description: Watchlist indicators with confirmed hits.
+          affected_hosts:
+            type: array
+            items:
+              type: string
+            description: One entry per host, formatted "host.name (ip, user)".
+          primary_host:
+            type: string
+            description: host.name of the most-affected endpoint ("" if none).
+          primary_host_ip:
+            type: string
+            description: IP of the most-affected endpoint ("" if none).
+          primary_user:
+            type: string
+            description: user.name on the most-affected endpoint ("" if none).
+          primary_domain:
+            type: string
+            description: The key malicious domain observed ("" if none).
+          recommended_actions:
+            type: array
+            items:
+              type: string
+            description: Prioritized containment / eradication steps.
+        required:
+          - threats_detected
+          - coverage_verdict
+          - headline
+          - severity
+    on-failure:
+      continue: true
+
+  # ===========================================================================
+  # PHASE 4 — CASE
+  # ===========================================================================
+
+  - name: create_case
+    type: cases.createCase
+    with:
+      # QA 2026-09-23: title used to take the LLM headline directly, which could claim
+      # active C2 while the same run's report said NO THREATS DETECTED. It now leads
+      # with the structured coverage_verdict, so title and body cannot disagree.
+      title: "[Daily Threat Hunt] {{ 'now' | date: '%Y-%m-%d' }} — {{ steps.extract_verdict.output.structured_output.coverage_verdict | default: 'insufficient_coverage' }} — {{ steps.extract_verdict.output.structured_output.headline | default: 'IOC watchlist sweep' }}"
+      description: |
+        **Automated daily threat hunt** (24-hour schedule) — IOC watchlist sweep across
+        all Vandelay Global Industries log data (Palo Alto firewall, CrowdStrike Falcon, AWS, Kubernetes,
+        Linux auth), driven by the `{{ consts.intel_index }}` watchlist.
+
+        **Verdict:** {{ steps.extract_verdict.output.structured_output.threats_detected | default: "see report" }}
+        — {{ steps.extract_verdict.output.structured_output.headline | default: "AI verdict unavailable; review the hunt report below." }}
+
+        **Severity (assessed):** {{ steps.extract_verdict.output.structured_output.severity | default: "—" }}
+        · **Affected hosts:** {{ steps.extract_verdict.output.structured_output.affected_hosts | default: "—" }}
+
+        **HUMAN REVIEW REQUIRED — verify findings before containment actions.**
+
+        Full agent hunt report, deterministic evidence, and the investigation workspace
+        are in the comments. Lookback: {{ consts.lookback_hours }} hours.
+      tags:
+        - workflow
+        - threat-hunt
+        - ioc-sweep
+        - daily
+        - automated
+        - vgi
+      severity: medium
+      owner: securitySolution
+      settings:
+        syncAlerts: false
+    on-failure:
+      continue: true
+
+  # ── Comment 1: the agent's full hunt report ────────────────────────────────
+  - name: add_report_comment
+    type: cases.addComment
+    with:
+      case_id: "{{ steps.create_case.output.case.id }}"
+      comment: |
+        ## Daily Threat Hunt — Agent Report
+
+        _The AI agent hunted the environment with live ES|QL queries
+        (platform.core.execute_esql) against the {{ consts.intel_index }} watchlist._
+
+        ---
+
+        {{ steps.ai_hunt.output.message | default: "_(Agent report unavailable — review the deterministic evidence below.)_" }}
+    on-failure:
+      continue: true
+
+  # ── Comment 2: deterministic evidence + Discover links ─────────────────────
+  - name: add_evidence_comment
+    type: cases.addComment
+    with:
+      case_id: "{{ steps.create_case.output.case.id }}"
+      comment: |
+        ## Deterministic Evidence (workflow-run queries)
+
+        ### IOC watchlist ({{ steps.get_all_iocs.output.values | size }} indicators)
+
+        | Type | Indicator | Description |
+        |---|---|---|
+        {%- for row in steps.get_all_iocs.output.values %}
+        | {{ row[0] }} | `{{ row[1] }}` | {{ row[2] }} |
+        {%- endfor %}
+
+        ### Domain sweep across ALL log data — {{ steps.sweep_domains.output.values | size }} matched domain(s)
+
+        Rows: hits · first/last seen · datasets · source IPs · hosts · users · domain
+
+        {%- for row in steps.sweep_domains.output.values %}
+        - `{{ row[7] }}` — **{{ row[0] }} hits** ({{ row[3] }}) · sources {{ row[4] }} · hosts {{ row[5] }} · users {{ row[6] }}
+        {%- endfor %}
+
+        ### CrowdStrike host attribution — {{ steps.crowdstrike_host_pivot.output.values | size }} host/domain pair(s)
+
+        {%- for row in steps.crowdstrike_host_pivot.output.values %}
+        - **{{ row[6] }}** resolved `{{ row[7] }}` **{{ row[0] }}×** (host ip {{ row[3] }}, falcon agent {{ row[4] }}, os {{ row[5] }})
+        {%- endfor %}
+
+        ### Pivot links
+
+        - [Firewall + endpoint hits for `{{ steps.extract_verdict.output.structured_output.primary_domain | default: "-" }}` →]({{ consts.kibana_base_url }}/app/discover#/?_a=(index:'{{ consts.logs_data_view_id }}',query:(language:kuery,query:'url.domain:%22{{ steps.extract_verdict.output.structured_output.primary_domain | default: "-" }}%22%20OR%20dns.question.name:%22{{ steps.extract_verdict.output.structured_output.primary_domain | default: "-" }}%22%20OR%20destination.domain:%22{{ steps.extract_verdict.output.structured_output.primary_domain | default: "-" }}%22'))&_g=(time:(from:now-{{ consts.lookback_hours }}h,to:now)))
+        - [All PAN THREAT alerts in the window →]({{ consts.kibana_base_url }}/app/discover#/?_a=(index:'{{ consts.logs_data_view_id }}',query:(language:kuery,query:'data_stream.dataset:panw.panos%20AND%20event.kind:alert'))&_g=(time:(from:now-{{ consts.lookback_hours }}h,to:now)))
+        - [CrowdStrike telemetry on {{ steps.extract_verdict.output.structured_output.primary_host | default: "the affected host" }} →]({{ consts.kibana_base_url }}/app/discover#/?_a=(index:'{{ consts.logs_data_view_id }}',query:(language:kuery,query:'data_stream.dataset:crowdstrike.fdr%20AND%20host.name:%22{{ steps.extract_verdict.output.structured_output.primary_host | default: "-" }}%22'))&_g=(time:(from:now-{{ consts.lookback_hours }}h,to:now)))
+    on-failure:
+      continue: true
+
+  # ── Comment 3: investigation workspace ─────────────────────────────────────
+  - name: add_workspace_comment
+    type: cases.addComment
+    with:
+      case_id: "{{ steps.create_case.output.case.id }}"
+      comment: |
+        ## Investigation Workspace
+
+        **[Open investigation dashboard — pre-filtered to this host →]({{ consts.kibana_base_url }}/app/dashboards#/view/{{ consts.investigation_dashboard_id }}?_g=(time:(from:now-{{ consts.lookback_hours }}h,to:now))&_a=(query:(language:kuery,query:'host.name:%22{{ steps.extract_verdict.output.structured_output.primary_host | default: "-" }}%22%20OR%20related.ip:%22{{ steps.extract_verdict.output.structured_output.primary_host_ip | default: "-" }}%22%20OR%20related.user:%22{{ steps.extract_verdict.output.structured_output.primary_user | default: "-" }}%22')))**
+
+        Every panel scopes to:
+        `host.name : "{{ steps.extract_verdict.output.structured_output.primary_host | default: "-" }}" OR related.ip : "{{ steps.extract_verdict.output.structured_output.primary_host_ip | default: "-" }}" OR related.user : "{{ steps.extract_verdict.output.structured_output.primary_user | default: "-" }}"`
+
+        ---
+
+        **Recommended actions (agent):**
+        {{ steps.extract_verdict.output.structured_output.recommended_actions | default: "see the hunt report" }}
+
+        ---
+
+        **[Open Attack Discovery →]({{ consts.kibana_base_url }}/app/security/attacks)** — chain
+        today's alerts (PAN spyware detections + any behavioral rules) into one narrative.
+
+        **Keep hunting:** open Agent Builder chat and ask follow-ups (e.g. _"has any other
+        host connected to {{ steps.extract_verdict.output.structured_output.primary_domain | default: "the C2 domain" }}?"_).
+    on-failure:
+      continue: true
+
+  # ===========================================================================
+  # PHASE 5 — LOG
+  # ===========================================================================
+
+  - name: log_complete
+    type: console
+    with:
+      message: |
+        ✅ VGI daily threat hunt complete.
+        Threats detected: {{ steps.extract_verdict.output.structured_output.threats_detected | default: "unknown" }}
+        Headline: {{ steps.extract_verdict.output.structured_output.headline | default: "-" }}
+        Case: {{ consts.kibana_base_url }}/app/security/cases/{{ steps.create_case.output.case.id }}
+        Watchlist indicators: {{ steps.get_all_iocs.output.values | size }}
+        Matched domains: {{ steps.sweep_domains.output.values | size }}
